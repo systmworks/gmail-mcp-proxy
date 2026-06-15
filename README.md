@@ -34,8 +34,8 @@ The server acts as an OAuth proxy: it presents itself as an OAuth 2.0 authorizat
 
 ## Prerequisites
 
-- Docker + Docker Compose
-- A reverse proxy that terminates HTTPS (the examples use [caddy-docker-proxy](https://github.com/lucaslorentz/caddy-docker-proxy))
+- Python 3.12+ (or Docker — a `Dockerfile` is included)
+- A reverse proxy that terminates HTTPS in front of the server's port `8000`
 - A Google Cloud project with:
   - **Gmail API** and **Google Calendar API** enabled
   - An OAuth 2.0 **Web application** client
@@ -60,11 +60,64 @@ cp .env.example .env
 # Fill in GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET
 # JWT_SECRET can be any long random string: openssl rand -hex 32
 # BASE_URL should be https://<your-domain>/gmail
-
-docker compose up -d
 ```
 
-The included `compose.yml` uses [caddy-docker-proxy](https://github.com/lucaslorentz/caddy-docker-proxy) labels. If you use a different proxy, adjust the labels or add your own reverse proxy config pointing to port `8000`.
+Run it however you prefer — the server listens on port `8000`:
+
+```bash
+# With Python directly
+pip install -r requirements.txt
+set -a && . ./.env && set +a   # load the variables from .env
+python server.py
+
+# Or with the included Dockerfile
+docker build -t gmail-mcp .
+docker run -d --env-file .env -p 8000:8000 gmail-mcp
+```
+
+Put it behind any reverse proxy that terminates HTTPS (Caddy, nginx, Traefik, …) and forwards `https://<your-domain>/gmail` to port `8000`.
+
+#### Docker Compose example
+
+A minimal `compose.yml` to run the container — uncomment the labels for whichever proxy you use:
+
+```yaml
+services:
+  gmail-mcp:
+    build: .
+    # image: gmail-mcp           # or a prebuilt image instead of build
+    env_file: .env
+    restart: unless-stopped
+    # expose the port only if your proxy reaches it directly (not via a shared network)
+    # ports:
+    #   - "8000:8000"
+
+    labels:
+      # ── caddy-docker-proxy ────────────────────────────────────────────────
+      # caddy: your-domain.com
+      # caddy.handle_path: /gmail*
+      # caddy.handle_path.reverse_proxy: "{{upstreams 8000}}"
+
+      # ── Traefik (strips the /gmail prefix before forwarding) ──────────────
+      # traefik.enable: "true"
+      # traefik.http.routers.gmail-mcp.rule: "Host(`your-domain.com`) && PathPrefix(`/gmail`)"
+      # traefik.http.routers.gmail-mcp.tls.certresolver: "le"
+      # traefik.http.routers.gmail-mcp.middlewares: "gmail-strip"
+      # traefik.http.middlewares.gmail-strip.stripprefix.prefixes: "/gmail"
+      # traefik.http.services.gmail-mcp.loadbalancer.server.port: "8000"
+```
+
+With **nginx** (no labels — point a `location` block at the container):
+
+```nginx
+location /gmail/ {
+    proxy_pass http://gmail-mcp:8000/;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+```
+
+Note: `BASE_URL` must match the public path the proxy serves (e.g. `https://your-domain.com/gmail`), since the server builds its OAuth redirect URIs from it.
 
 ### 3. Connect to Claude.ai
 
