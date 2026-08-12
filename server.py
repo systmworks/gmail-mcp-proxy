@@ -35,7 +35,7 @@ log = logging.getLogger("gmail_mcp")
 
 GOOGLE_CLIENT_ID = os.environ["GOOGLE_CLIENT_ID"]
 GOOGLE_CLIENT_SECRET = os.environ["GOOGLE_CLIENT_SECRET"]
-BASE_URL = os.environ["BASE_URL"].rstrip("/")  # e.g. https://mcp.gar.im/gmail
+BASE_URL = os.environ["BASE_URL"].rstrip("/")  # e.g. https://your-app.up.railway.app
 JWT_SECRET = os.environ["JWT_SECRET"]
 
 HTTPX_TIMEOUT = 30.0
@@ -80,6 +80,18 @@ def _google_scopes(read_only: bool) -> str:
 
 GMAIL = "https://gmail.googleapis.com/gmail/v1/users/me"
 GCAL = "https://www.googleapis.com/calendar/v3"
+
+# Shared connection-pooled client for all outbound Gmail/Calendar/Google OAuth requests.
+# Created/closed around the ASGI lifespan in _App.__call__ — avoids paying a fresh
+# TCP+TLS handshake to googleapis.com on every single tool call.
+_http_client: httpx.AsyncClient | None = None
+
+
+def _client() -> httpx.AsyncClient:
+    if _http_client is None:
+        raise RuntimeError("HTTP client not initialized — server lifespan hasn't started")
+    return _http_client
+
 
 # ── In-memory stores ───────────────────────────────────────────────────────────
 # Fine for single-process personal use; restart clears sessions (re-auth needed).
@@ -136,14 +148,14 @@ async def _refresh(jti: str) -> str:
         if time.time() < d["expiry"] - 60:
             # Another coroutine already refreshed while we waited on the lock.
             return d["access_token"]
-        async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as c:
-            r = await c.post("https://oauth2.googleapis.com/token", data={
-                "client_id": GOOGLE_CLIENT_ID,
-                "client_secret": GOOGLE_CLIENT_SECRET,
-                "refresh_token": d["refresh_token"],
-                "grant_type": "refresh_token",
-            })
-            t = r.json()
+        c = _client()
+        r = await c.post("https://oauth2.googleapis.com/token", data={
+            "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
+            "refresh_token": d["refresh_token"],
+            "grant_type": "refresh_token",
+        })
+        t = r.json()
         if "access_token" not in t:
             _token_store.pop(jti, None)
             _refresh_locks.pop(jti, None)
@@ -210,10 +222,10 @@ mcp = FastMCP("Gmail MCP")
 @mcp.tool
 async def get_profile() -> dict:
     """Get the authenticated Gmail account's profile."""
-    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as c:
-        r = await c.get(f"{GMAIL}/profile", headers=_auth())
-        r.raise_for_status()
-        return r.json()
+    c = _client()
+    r = await c.get(f"{GMAIL}/profile", headers=_auth())
+    r.raise_for_status()
+    return r.json()
 
 
 @mcp.tool
@@ -222,33 +234,39 @@ async def search_emails(query: str, max_results: int = 20) -> list[dict]:
     Each of the first 100 results includes from/to/subject/date/snippet/labels alongside
     id/threadId, so most questions about the results don't need a follow-up read_message
     call. Beyond 100 results, only id/threadId are included."""
-    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as c:
-        r = await c.get(f"{GMAIL}/messages", headers=_auth(),
-                        params={"q": query, "maxResults": max_results})
-        r.raise_for_status()
-        messages = r.json().get("messages", [])
+    c = _client()
+    r = await c.get(f"{GMAIL}/messages", headers=_auth(),
+                    params={"q": query, "maxResults": max_results})
+    r.raise_for_status()
+    messages = r.json().get("messages", [])
 
-        to_enrich, rest = messages[:SEARCH_ENRICH_LIMIT], messages[SEARCH_ENRICH_LIMIT:]
+    to_enrich, rest = messages[:SEARCH_ENRICH_LIMIT], messages[SEARCH_ENRICH_LIMIT:]
 
-        async def _enrich(msg: dict) -> dict:
+    async def _enrich(msg: dict) -> dict:
+        try:
             er = await c.get(f"{GMAIL}/messages/{msg['id']}", headers=_auth(),
                              params={"format": "metadata",
                                      "metadataHeaders": ["From", "To", "Subject", "Date"]})
-            if not er.is_success:
-                return msg
-            data = er.json()
-            hdrs = {h["name"]: h["value"] for h in data.get("payload", {}).get("headers", [])}
-            return {
-                **msg,
-                "from": hdrs.get("From", ""),
-                "to": hdrs.get("To", ""),
-                "subject": hdrs.get("Subject", ""),
-                "date": hdrs.get("Date", ""),
-                "snippet": data.get("snippet", ""),
-                "labels": data.get("labelIds", []),
-            }
+        except httpx.HTTPError:
+            # Network-level failure (timeout, connection reset, etc.) for this one
+            # message — degrade to bare id/threadId rather than failing the whole
+            # search, same as the is_success check below already does for HTTP errors.
+            return msg
+        if not er.is_success:
+            return msg
+        data = er.json()
+        hdrs = {h["name"]: h["value"] for h in data.get("payload", {}).get("headers", [])}
+        return {
+            **msg,
+            "from": hdrs.get("From", ""),
+            "to": hdrs.get("To", ""),
+            "subject": hdrs.get("Subject", ""),
+            "date": hdrs.get("Date", ""),
+            "snippet": data.get("snippet", ""),
+            "labels": data.get("labelIds", []),
+        }
 
-        enriched = await asyncio.gather(*(_enrich(m) for m in to_enrich))
+    enriched = await asyncio.gather(*(_enrich(m) for m in to_enrich))
 
     return list(enriched) + rest
 
@@ -256,26 +274,30 @@ async def search_emails(query: str, max_results: int = 20) -> list[dict]:
 @mcp.tool
 async def read_message(message_id: str) -> dict:
     """Read a Gmail message by ID. Returns headers and decoded body."""
-    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as c:
-        r = await c.get(f"{GMAIL}/messages/{message_id}", headers=_auth(),
-                        params={"format": "full"})
-        r.raise_for_status()
-        data = r.json()
+    c = _client()
+    r = await c.get(f"{GMAIL}/messages/{message_id}", headers=_auth(),
+                    params={"format": "full"})
+    r.raise_for_status()
+    data = r.json()
 
-    def _extract_body(part: dict, mime: str) -> str:
-        # Recurses into nested parts (e.g. multipart/mixed > multipart/alternative > text/plain).
-        if part.get("mimeType") == mime:
+    def _find_bodies(part: dict, found: dict) -> None:
+        # Single recursive pass collecting both text/plain and text/html (e.g.
+        # multipart/mixed > multipart/alternative > text/plain), preferring
+        # plain over html once done rather than walking the tree twice.
+        mime = part.get("mimeType")
+        if mime in ("text/plain", "text/html") and mime not in found:
             raw = part.get("body", {}).get("data", "")
             if raw:
-                return base64.urlsafe_b64decode(raw + "==").decode("utf-8", errors="replace")
+                found[mime] = base64.urlsafe_b64decode(raw + "==").decode("utf-8", errors="replace")
         for sub in part.get("parts", []):
-            found = _extract_body(sub, mime)
-            if found:
-                return found
-        return ""
+            if "text/plain" in found and "text/html" in found:
+                return
+            _find_bodies(sub, found)
 
     payload = data.get("payload", {})
-    body = _extract_body(payload, "text/plain") or _extract_body(payload, "text/html")
+    bodies: dict[str, str] = {}
+    _find_bodies(payload, bodies)
+    body = bodies.get("text/plain") or bodies.get("text/html", "")
 
     hdrs = {h["name"]: h["value"] for h in payload.get("headers", [])}
     return {
@@ -294,10 +316,10 @@ async def read_message(message_id: str) -> dict:
 @mcp.tool
 async def read_thread(thread_id: str) -> dict:
     """Read a full Gmail thread."""
-    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as c:
-        r = await c.get(f"{GMAIL}/threads/{thread_id}", headers=_auth())
-        r.raise_for_status()
-        return r.json()
+    c = _client()
+    r = await c.get(f"{GMAIL}/threads/{thread_id}", headers=_auth())
+    r.raise_for_status()
+    return r.json()
 
 
 @mcp.tool
@@ -309,56 +331,134 @@ async def send_email(to: str, subject: str, body: str, cc: str = "",
     in_reply_to = ""
     references = ""
     if reply_to_message_id:
-        async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as c:
-            r = await c.get(f"{GMAIL}/messages/{reply_to_message_id}", headers=_auth(),
-                            params={"format": "metadata",
-                                    "metadataHeaders": ["Message-ID", "References"]})
-            # Fail loudly rather than silently sending an unthreaded standalone email
-            # when the caller explicitly asked for a reply.
-            r.raise_for_status()
-            msg = r.json()
-            thread_id = msg.get("threadId", "")
-            hdrs = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
-            in_reply_to = hdrs.get("Message-ID", "")
-            references = (hdrs.get("References", "") + " " + in_reply_to).strip()
+        c = _client()
+        r = await c.get(f"{GMAIL}/messages/{reply_to_message_id}", headers=_auth(),
+                        params={"format": "metadata",
+                                "metadataHeaders": ["Message-ID", "References"]})
+        # Fail loudly rather than silently sending an unthreaded standalone email
+        # when the caller explicitly asked for a reply.
+        r.raise_for_status()
+        msg = r.json()
+        thread_id = msg.get("threadId", "")
+        hdrs = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
+        in_reply_to = hdrs.get("Message-ID", "")
+        references = (hdrs.get("References", "") + " " + in_reply_to).strip()
 
     payload: dict = {"raw": _build_email(to, subject, body, cc, in_reply_to, references)}
     if thread_id:
         payload["threadId"] = thread_id
-    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as c:
-        r = await c.post(f"{GMAIL}/messages/send", headers=_auth(), json=payload)
-        r.raise_for_status()
-        return r.json()
+    c = _client()
+    r = await c.post(f"{GMAIL}/messages/send", headers=_auth(), json=payload)
+    r.raise_for_status()
+    return r.json()
 
 
 @mcp.tool
 async def create_draft(to: str, subject: str, body: str, cc: str = "") -> dict:
     """Create a Gmail draft."""
     _require_write()
-    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as c:
-        r = await c.post(f"{GMAIL}/drafts", headers=_auth(),
-                         json={"message": {"raw": _build_email(to, subject, body, cc)}})
-        r.raise_for_status()
-        return r.json()
+    c = _client()
+    r = await c.post(f"{GMAIL}/drafts", headers=_auth(),
+                     json={"message": {"raw": _build_email(to, subject, body, cc)}})
+    r.raise_for_status()
+    return r.json()
 
 
 @mcp.tool
 async def list_drafts(max_results: int = 10) -> list[dict]:
     """List Gmail drafts."""
-    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as c:
-        r = await c.get(f"{GMAIL}/drafts", headers=_auth(),
-                        params={"maxResults": max_results})
+    c = _client()
+    r = await c.get(f"{GMAIL}/drafts", headers=_auth(),
+                    params={"maxResults": max_results})
+    r.raise_for_status()
+    return r.json().get("drafts", [])
+
+
+@mcp.tool
+async def send_draft(draft_id: str) -> dict:
+    """Send an existing Gmail draft."""
+    _require_write()
+    c = _client()
+    r = await c.post(f"{GMAIL}/drafts/send", headers=_auth(),
+                     json={"id": draft_id})
+    r.raise_for_status()
+    return r.json()
+
+
+@mcp.tool
+async def update_draft(draft_id: str, to: str, subject: str, body: str,
+                       cc: str = "") -> dict:
+    """Replace the content of an existing Gmail draft."""
+    _require_write()
+    c = _client()
+    r = await c.put(f"{GMAIL}/drafts/{draft_id}", headers=_auth(),
+                    json={"message": {"raw": _build_email(to, subject, body, cc)}})
+    r.raise_for_status()
+    return r.json()
+
+
+@mcp.tool
+async def delete_draft(draft_id: str) -> dict:
+    """Permanently delete a Gmail draft."""
+    _require_write()
+    c = _client()
+    r = await c.delete(f"{GMAIL}/drafts/{draft_id}", headers=_auth())
+    if r.status_code != 204:
         r.raise_for_status()
-        return r.json().get("drafts", [])
+    return {"deleted": draft_id}
 
 
 @mcp.tool
 async def list_labels() -> list[dict]:
     """List all Gmail labels."""
-    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as c:
-        r = await c.get(f"{GMAIL}/labels", headers=_auth())
+    c = _client()
+    r = await c.get(f"{GMAIL}/labels", headers=_auth())
+    r.raise_for_status()
+    return r.json().get("labels", [])
+
+
+@mcp.tool
+async def create_label(name: str, label_list_visibility: str = "labelShow",
+                       message_list_visibility: str = "show") -> dict:
+    """Create a new Gmail label."""
+    _require_write()
+    c = _client()
+    r = await c.post(f"{GMAIL}/labels", headers=_auth(),
+                     json={"name": name,
+                           "labelListVisibility": label_list_visibility,
+                           "messageListVisibility": message_list_visibility})
+    r.raise_for_status()
+    return r.json()
+
+
+@mcp.tool
+async def update_label(label_id: str, name: str | None = None,
+                       label_list_visibility: str | None = None,
+                       message_list_visibility: str | None = None) -> dict:
+    """Rename or change visibility of an existing Gmail label."""
+    _require_write()
+    body = {}
+    if name is not None:
+        body["name"] = name
+    if label_list_visibility is not None:
+        body["labelListVisibility"] = label_list_visibility
+    if message_list_visibility is not None:
+        body["messageListVisibility"] = message_list_visibility
+    c = _client()
+    r = await c.patch(f"{GMAIL}/labels/{label_id}", headers=_auth(), json=body)
+    r.raise_for_status()
+    return r.json()
+
+
+@mcp.tool
+async def delete_label(label_id: str) -> dict:
+    """Permanently delete a Gmail label."""
+    _require_write()
+    c = _client()
+    r = await c.delete(f"{GMAIL}/labels/{label_id}", headers=_auth())
+    if r.status_code != 204:
         r.raise_for_status()
-        return r.json().get("labels", [])
+    return {"deleted": label_id}
 
 
 @mcp.tool
@@ -366,30 +466,41 @@ async def modify_labels(message_id: str, add: list[str] | None = None,
                         remove: list[str] | None = None) -> dict:
     """Add or remove labels on a Gmail message."""
     _require_write()
-    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as c:
-        r = await c.post(f"{GMAIL}/messages/{message_id}/modify", headers=_auth(),
-                         json={"addLabelIds": add or [], "removeLabelIds": remove or []})
-        r.raise_for_status()
-        return r.json()
+    c = _client()
+    r = await c.post(f"{GMAIL}/messages/{message_id}/modify", headers=_auth(),
+                     json={"addLabelIds": add or [], "removeLabelIds": remove or []})
+    r.raise_for_status()
+    return r.json()
+
+
+@mcp.tool
+async def report_phishing(message_id: str) -> dict:
+    """Mark a Gmail message as spam."""
+    _require_write()
+    c = _client()
+    r = await c.post(f"{GMAIL}/messages/{message_id}/modify", headers=_auth(),
+                     json={"addLabelIds": ["SPAM"], "removeLabelIds": ["INBOX"]})
+    r.raise_for_status()
+    return r.json()
 
 
 @mcp.tool
 async def trash_message(message_id: str) -> dict:
     """Move a Gmail message to trash."""
     _require_write()
-    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as c:
-        r = await c.post(f"{GMAIL}/messages/{message_id}/trash", headers=_auth())
-        r.raise_for_status()
-        return r.json()
+    c = _client()
+    r = await c.post(f"{GMAIL}/messages/{message_id}/trash", headers=_auth())
+    r.raise_for_status()
+    return r.json()
 
 
 @mcp.tool
 async def list_calendars() -> list[dict]:
     """List all Google Calendars."""
-    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as c:
-        r = await c.get(f"{GCAL}/users/me/calendarList", headers=_auth())
-        r.raise_for_status()
-        return r.json().get("items", [])
+    c = _client()
+    r = await c.get(f"{GCAL}/users/me/calendarList", headers=_auth())
+    r.raise_for_status()
+    return r.json().get("items", [])
 
 
 @mcp.tool
@@ -401,32 +512,32 @@ async def list_events(calendar_id: str = "primary", time_min: str = "",
         params["timeMin"] = time_min
     if time_max:
         params["timeMax"] = time_max
-    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as c:
-        r = await c.get(f"{GCAL}/calendars/{calendar_id}/events",
-                        headers=_auth(), params=params)
-        r.raise_for_status()
-        return r.json().get("items", [])
+    c = _client()
+    r = await c.get(f"{GCAL}/calendars/{calendar_id}/events",
+                    headers=_auth(), params=params)
+    r.raise_for_status()
+    return r.json().get("items", [])
 
 
 @mcp.tool
 async def search_events(query: str, calendar_id: str = "primary",
                         max_results: int = 10) -> list[dict]:
     """Search calendar events by keyword."""
-    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as c:
-        r = await c.get(f"{GCAL}/calendars/{calendar_id}/events", headers=_auth(),
-                        params={"q": query, "maxResults": max_results, "singleEvents": True})
-        r.raise_for_status()
-        return r.json().get("items", [])
+    c = _client()
+    r = await c.get(f"{GCAL}/calendars/{calendar_id}/events", headers=_auth(),
+                    params={"q": query, "maxResults": max_results, "singleEvents": True})
+    r.raise_for_status()
+    return r.json().get("items", [])
 
 
 @mcp.tool
 async def get_event(event_id: str, calendar_id: str = "primary") -> dict:
     """Get a specific calendar event by ID."""
-    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as c:
-        r = await c.get(f"{GCAL}/calendars/{calendar_id}/events/{event_id}",
-                        headers=_auth())
-        r.raise_for_status()
-        return r.json()
+    c = _client()
+    r = await c.get(f"{GCAL}/calendars/{calendar_id}/events/{event_id}",
+                    headers=_auth())
+    r.raise_for_status()
+    return r.json()
 
 
 # ── OAuth endpoints ────────────────────────────────────────────────────────────
@@ -507,27 +618,27 @@ async def _auth_callback(req: Request):
     if not state_data:
         return Response("Invalid or expired state", status_code=400)
 
-    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as c:
-        r = await c.post("https://oauth2.googleapis.com/token", data={
-            "code": req.query_params.get("code"),
-            "client_id": GOOGLE_CLIENT_ID,
-            "client_secret": GOOGLE_CLIENT_SECRET,
-            "redirect_uri": f"{BASE_URL}/auth/callback",
-            "grant_type": "authorization_code",
-        })
-        tokens = r.json()
+    c = _client()
+    r = await c.post("https://oauth2.googleapis.com/token", data={
+        "code": req.query_params.get("code"),
+        "client_id": GOOGLE_CLIENT_ID,
+        "client_secret": GOOGLE_CLIENT_SECRET,
+        "redirect_uri": f"{BASE_URL}/auth/callback",
+        "grant_type": "authorization_code",
+    })
+    tokens = r.json()
 
     if "error" in tokens:
         log.warning("Google token exchange failed: %s", tokens["error"])
         return Response(f"Token exchange failed: {tokens['error']}", status_code=400)
 
-    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as c:
-        ui = await c.get("https://www.googleapis.com/oauth2/v3/userinfo",
-                         headers={"Authorization": f"Bearer {tokens['access_token']}"})
-        if not ui.is_success:
-            log.warning("Google userinfo fetch failed (%s): %s", ui.status_code, ui.text[:200])
-            return Response("Failed to fetch Google account info", status_code=502)
-        userinfo = ui.json()
+    c = _client()
+    ui = await c.get("https://www.googleapis.com/oauth2/v3/userinfo",
+                     headers={"Authorization": f"Bearer {tokens['access_token']}"})
+    if not ui.is_success:
+        log.warning("Google userinfo fetch failed (%s): %s", ui.status_code, ui.text[:200])
+        return Response("Failed to fetch Google account info", status_code=502)
+    userinfo = ui.json()
 
     log.info("new session authenticated: %s (read_only=%s)",
              userinfo.get("email"), state_data.get("read_only", False))
@@ -658,7 +769,12 @@ class _App:
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "lifespan":
-            await self._mcp(scope, receive, send)
+            global _http_client
+            _http_client = httpx.AsyncClient(timeout=HTTPX_TIMEOUT)
+            try:
+                await self._mcp(scope, receive, send)
+            finally:
+                await _http_client.aclose()
             return
 
         if scope["type"] == "http":

@@ -8,6 +8,67 @@ entry above it.
 
 ## 2026-08-12
 
+### 0.13 — Code quality review #4: shared HTTP client, search resilience, first tests
+
+Fourth review pass, this time comparing against ArtyMcLabin/Gmail-MCP-Server's
+own hardening approach for ideas. Found one real bug and one real efficiency
+problem; the rest were smaller robustness/staleness cleanups.
+
+**Fixed**
+- `search_emails`: a network-level exception (timeout, connection reset) enriching
+  any one of up to 100 concurrent messages used to fail the *entire* search instead
+  of degrading just that message to bare id/threadId, contradicting the tool's own
+  docstring. `_enrich` now catches `httpx.HTTPError` around the fetch, same as the
+  existing HTTP-status fallback.
+
+**Changed**
+- All ~25 call sites that opened a fresh `httpx.AsyncClient` (and therefore a new
+  TCP+TLS connection to googleapis.com) per tool call now share one pooled client,
+  created on ASGI lifespan startup and closed on shutdown (`_http_client` in
+  `_App.__call__`). Cuts connection-setup latency off every single tool invocation.
+  Access goes through a `_client()` helper that raises a clear `RuntimeError`
+  instead of a bare `AttributeError` if ever called before the lifespan sets it
+  (caught by running `mypy` over the change — `_http_client`'s `| None` type was
+  otherwise silently unchecked at all 25 call sites).
+- `read_message`: `_extract_body` walked the MIME part tree twice (once for
+  text/plain, once for text/html on fallback). Replaced with a single recursive
+  pass (`_find_bodies`) that collects both and prefers plain.
+- `.env.example` and a `server.py` comment: replaced the leftover
+  `mcp.gar.im` example domain (inherited from the upstream fork point) with a
+  generic placeholder — README's own example was already generic.
+
+**Added**
+- First test suite for the project: `tests/`, `pytest.ini`, `requirements-dev.txt`.
+  Covers the pure-logic helpers (`_pkce_ok`, `_alias_from_resource`, `_split_alias`,
+  `_build_email`) directly, and tool behavior via `respx`-mocked Gmail responses —
+  including a regression test for the `search_emails` fix above, 204-No-Content
+  handling on `delete_draft`/`delete_label`, and read-only enforcement. No live
+  Google credentials needed to run them (`pip install -r requirements-dev.txt &&
+  pytest`).
+
+### 0.12 — Draft lifecycle, label CRUD, and report_phishing tools
+
+Closed the highest-value gaps found while comparing this project against
+ArtyMcLabin/Gmail-MCP-Server (an unrelated but much larger local-stdio Gmail MCP
+server): drafts could be created and listed but never sent, edited, or discarded
+through the tool surface; labels could be listed and toggled on messages but not
+created, renamed, or deleted; and marking a message as spam required knowing to call
+`modify_labels` with the `SPAM` system label directly rather than a purpose-named
+tool. No new OAuth scopes needed — `gmail.send`, `gmail.compose`, and `gmail.modify`
+(already requested) cover all seven additions.
+
+**Added**
+- `send_draft`, `update_draft`, `delete_draft` — full draft lifecycle, reusing the
+  existing `_build_email()` MIME builder for `update_draft`. `drafts.delete` returns
+  204 No Content, so `delete_draft` checks the status code instead of calling
+  `.json()` unconditionally like the other write tools.
+- `create_label`, `update_label`, `delete_label` — full label management alongside
+  the existing `list_labels`/`modify_labels`. `update_label` only sends the fields
+  that were actually passed (partial update via `PATCH`). Same 204-handling note
+  applies to `delete_label`.
+- `report_phishing` — thin wrapper over the same `messages/{id}/modify` endpoint
+  `modify_labels` already uses, adding `SPAM` and removing `INBOX`.
+
 ### 0.11 — Raise search_emails enrichment cap to 100
 
 Verified against Google's own Gmail API quota docs before changing the number rather
