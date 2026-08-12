@@ -3,7 +3,32 @@
 All notable changes to this project are documented here. Dated entries, keyed to
 commits — this repo isn't tagged/released, so there are no version numbers.
 
-## 2026-08-12 — Code quality review
+## 2026-08-12 — Code quality review #2
+
+### Fixed
+- `_refresh_locks` no longer leaks a lock per session when a token refresh fails
+  (revoked/expired) — only the natural-expiry cleanup path handled this before.
+- `_auth_callback` now checks the Google userinfo fetch succeeded instead of silently
+  creating a session/JWT bound to a `None` identity on failure.
+
+### Security
+- `_pkce_ok` now compares the PKCE challenge with a constant-time comparison
+  (`hmac.compare_digest`) instead of `==`.
+- Added standard security response headers (`Strict-Transport-Security`,
+  `X-Content-Type-Options`, `X-Frame-Options`) to every response.
+- Docker image now runs as a non-root user.
+- `requirements.txt` now has upper version bounds on all floor-pinned dependencies.
+
+### Added
+- Structured logging throughout the OAuth flow and the bearer-auth check, so failures
+  (expired JWTs, revoked refresh tokens, Google API errors, unexpected bugs) are
+  distinguishable in the log stream instead of all looking like a silent 401. Level
+  configurable via `LOG_LEVEL` (default `INFO`). Logs error codes/messages and email
+  addresses only — never tokens, secrets, or PKCE verifiers.
+- Per-request cleanup (`_purge_expired_states`/`_purge_expired_tokens`) is now wrapped
+  so a bug there can't take down every request.
+
+## 2026-08-12 — Code quality review #1 (820bcb8)
 
 ### Security
 - `/authorize` now rejects any `redirect_uri` outside an explicit allowlist
