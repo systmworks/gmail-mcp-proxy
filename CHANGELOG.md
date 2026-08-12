@@ -1,11 +1,27 @@
 # Changelog
 
-All notable changes to this project, in version order. This repo isn't tagged/released
-on GitHub, so these are informal version numbers rather than official releases —
-starting at 0.1 for the original fork and incrementing from there. A date heading only
-appears when the date changes from the entry above it.
+All notable changes to this project, in version order — starting at 0.1 for the
+original fork and incrementing from there. No GitHub Releases (no external consumers to
+serve release notes to), but working milestones get a lightweight git tag (`v0.1`, `v0.2`,
+…) as a rollback anchor. A date heading only appears when the date changes from the
+entry above it.
 
 ## 2026-08-12
+
+### 0.11 — Raise search_emails enrichment cap to 100
+
+Verified against Google's own Gmail API quota docs before changing the number rather
+than guessing: per-user limit is 6,000 quota units/minute, `messages.get` costs 20
+units, `messages.list` costs 5. At the previous cap of 50, one fully-enriched search
+cost ~1,005 units (~6/minute of headroom); at 100 it's ~2,005 units (~3/minute) — still
+comfortable for normal usage. 200 was considered and rejected for now: a single turn
+with two enrichment-heavy searches back-to-back could brush the limit (degrades
+gracefully if so — individual failed fetches already fall back to bare id/threadId
+rather than erroring — but 100 has enough headroom not to worry about it).
+
+**Changed**
+- `SEARCH_ENRICH_LIMIT`: 50 → 100. Would have covered all 84 messages in the search
+  that first surfaced the cutover, instead of dropping 34 to bare id/threadId.
 
 ### 0.10 — Code quality review #3
 

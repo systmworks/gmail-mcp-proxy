@@ -40,7 +40,7 @@ JWT_SECRET = os.environ["JWT_SECRET"]
 
 HTTPX_TIMEOUT = 30.0
 STATE_TTL = 600  # seconds; abandoned OAuth flows are purged after this
-SEARCH_ENRICH_LIMIT = 50  # max search_emails results to fetch metadata for per call
+SEARCH_ENRICH_LIMIT = 100  # max search_emails results to fetch metadata for per call
 
 # Redirect URIs /authorize is allowed to send the auth code to. Without this allowlist,
 # an attacker can craft an /authorize?redirect_uri=<attacker-controlled> link and, once
@@ -219,9 +219,9 @@ async def get_profile() -> dict:
 @mcp.tool
 async def search_emails(query: str, max_results: int = 20) -> list[dict]:
     """Search Gmail. Supports all Gmail search operators (from:, subject:, has:attachment, etc.).
-    Each of the first 50 results includes from/to/subject/date/snippet/labels alongside
+    Each of the first 100 results includes from/to/subject/date/snippet/labels alongside
     id/threadId, so most questions about the results don't need a follow-up read_message
-    call. Beyond 50 results, only id/threadId are included."""
+    call. Beyond 100 results, only id/threadId are included."""
     async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as c:
         r = await c.get(f"{GMAIL}/messages", headers=_auth(),
                         params={"q": query, "maxResults": max_results})
