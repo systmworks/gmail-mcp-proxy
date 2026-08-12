@@ -7,6 +7,19 @@ appears when the date changes from the entry above it.
 
 ## 2026-08-12
 
+### 0.10 — Code quality review #3
+
+Third review pass, specifically hunting for bugs, dead/stale code, and complexity not
+earning its keep. No new bugs found — this round is two small cleanups plus a written
+record of what was deliberately left alone (see the commit message for the full list).
+
+**Changed**
+- `_oauth_server_metadata` and `_openid_configuration` shared 6 of 7 fields verbatim;
+  extracted into `_base_oauth_metadata()`.
+- `.env.example` now lists `ALLOWED_REDIRECT_URIS`, `LOG_LEVEL`, `READ_ONLY_ALIASES` —
+  all three were added earlier today but never added here, so they were easy to miss
+  when setting up a new deployment.
+
 ### 0.9 — Enrich search_emails results (2405ac8)
 
 Found during live testing: summarizing senders/subjects from search results required a
