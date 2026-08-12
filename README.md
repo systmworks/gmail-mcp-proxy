@@ -18,7 +18,7 @@ The server acts as an OAuth proxy: it presents itself as an OAuth 2.0 authorizat
 | Tool | Description |
 |------|-------------|
 | `get_profile` | Gmail account profile |
-| `search_emails` | Search with Gmail operators (`from:`, `subject:`, `has:attachment`, …) |
+| `search_emails` | Search with Gmail operators (`from:`, `subject:`, `has:attachment`, …). First 50 results include from/to/subject/date/snippet/labels, not just id/threadId. |
 | `read_message` | Full message with decoded body |
 | `read_thread` | Full thread |
 | `send_email` | Send or reply to a thread |

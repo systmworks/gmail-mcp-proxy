@@ -3,6 +3,22 @@
 All notable changes to this project are documented here. Dated entries, keyed to
 commits — this repo isn't tagged/released, so there are no version numbers.
 
+## 2026-08-12 — Enrich search_emails results
+
+Found during live testing: summarizing senders/subjects from search results required a
+separate read_message call per message, or narrower per-sender searches as a
+workaround — because Gmail's messages.list endpoint (which search_emails calls) has
+never returned anything beyond id/threadId. Not a bug, but a real usability gap worth
+closing.
+
+### Added
+- `search_emails` now fetches from/to/subject/date/snippet/labels for the first 50
+  results (parallelized, reusing one HTTP connection) so most follow-up questions about
+  search results don't need a separate `read_message` call. Capped at 50 regardless of
+  `max_results` so a large explicit value can't fan out into hundreds of API calls;
+  results beyond the cap still come back as bare id/threadId. Individual fetch failures
+  fall back to the bare id/threadId for that message rather than failing the search.
+
 ## 2026-08-12 — Fix alias detection for per-alias read-only
 
 Verified live against a real deployment: connecting a `READ_ONLY_ALIASES`-restricted
