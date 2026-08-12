@@ -159,6 +159,30 @@ Click **Connect** and authenticate with your Google account.
 | `BASE_URL` | Public base URL, e.g. `https://example.com/gmail` (no trailing slash) |
 | `ALLOWED_REDIRECT_URIS` | Optional. Comma-separated allowlist of OAuth redirect URIs `/authorize` will accept. Defaults to Claude.ai's callback (`https://claude.ai/api/mcp/auth_callback`) — only change this if you're connecting a non-Claude.ai MCP client. |
 | `LOG_LEVEL` | Optional. Python logging level (`INFO`, `WARNING`, `DEBUG`, etc.). Defaults to `INFO`. |
+| `READ_ONLY_ALIASES` | Optional. Comma-separated list of connector aliases (e.g. `work`) that should be restricted to read-only access — no send, draft, label changes, or trash. See below. |
+
+## Read-only accounts
+
+To connect an account you want Claude to only ever read from — never send, delete, or
+modify — add its alias to `READ_ONLY_ALIASES`, e.g. `READ_ONLY_ALIASES=work` for a
+connector added at `/work/mcp`. That account's Google OAuth grant will only ever request
+`gmail.readonly`/`calendar.readonly` — no write scope is ever issued for it, so even a
+bug in this server can't make it send or delete anything; Google's API rejects it
+regardless. The server also refuses write tool calls itself with a clear error, as a
+second layer.
+
+**This depends on Claude sending the standard OAuth `resource` parameter** identifying
+which connector is authenticating, which MCP's authorization spec calls for but isn't
+something this project controls. After connecting a read-only-configured account, verify
+it actually took effect:
+
+1. Check the server logs right after connecting — look for a line like
+   `authorize: alias='work' resource='...' -> read-only`. If `alias` comes back empty
+   instead, the restriction silently didn't apply for that connection, even though the
+   account was still granted read access — reconnect and check again, and if it keeps
+   happening, treat that alias as read/write for now.
+2. Ask Claude, through that connector, to send a test email or trash a message. It
+   should be refused.
 
 ## Notes
 

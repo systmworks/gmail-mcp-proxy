@@ -3,6 +3,20 @@
 All notable changes to this project are documented here. Dated entries, keyed to
 commits — this repo isn't tagged/released, so there are no version numbers.
 
+## 2026-08-12 — Per-alias read-only access
+
+### Added
+- `READ_ONLY_ALIASES` env var: aliased connectors named here (e.g. `work`) now get a
+  Google OAuth grant covering only `gmail.readonly`/`calendar.readonly` — no write scope
+  is ever issued for that session, so a bug in this server can't make it send or delete
+  anything regardless of what the server-side code does. The server also refuses the
+  four write tools (`send_email`, `create_draft`, `modify_labels`, `trash_message`)
+  itself for read-only sessions, as a second layer.
+- Which alias is authenticating is detected from the OAuth `resource` parameter
+  (RFC 8707) on `/authorize`, logged at INFO so it's verifiable after connecting —
+  see the README's "Read-only accounts" section for how to check it actually took
+  effect for a given connector.
+
 ## 2026-08-12 — Code quality review #2
 
 ### Fixed

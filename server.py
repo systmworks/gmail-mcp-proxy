@@ -15,7 +15,7 @@ import secrets
 import time
 from contextvars import ContextVar
 from email.mime.text import MIMEText
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 import httpx
 import jwt
@@ -51,16 +51,31 @@ ALLOWED_REDIRECT_URIS = frozenset(
     ).split(",") if u.strip()
 )
 
-GOOGLE_SCOPES = " ".join([
+# Aliased connectors (e.g. /work/mcp) named here get Google scopes covering only
+# read access — see _google_scopes() and _alias_from_resource() below.
+READ_ONLY_ALIASES = frozenset(
+    a.strip().strip("/") for a in os.environ.get("READ_ONLY_ALIASES", "").split(",")
+    if a.strip()
+)
+
+GOOGLE_SCOPES_BASE = [
     "openid",
     "https://www.googleapis.com/auth/userinfo.email",
     "https://www.googleapis.com/auth/userinfo.profile",
     "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/calendar.readonly",
+]
+GOOGLE_SCOPES_WRITE = [
     "https://www.googleapis.com/auth/gmail.send",
     "https://www.googleapis.com/auth/gmail.compose",
     "https://www.googleapis.com/auth/gmail.modify",
-    "https://www.googleapis.com/auth/calendar.readonly",
-])
+]
+
+
+def _google_scopes(read_only: bool) -> str:
+    scopes = GOOGLE_SCOPES_BASE if read_only else GOOGLE_SCOPES_BASE + GOOGLE_SCOPES_WRITE
+    return " ".join(scopes)
+
 
 GMAIL = "https://gmail.googleapis.com/gmail/v1/users/me"
 GCAL = "https://www.googleapis.com/calendar/v3"
@@ -77,6 +92,7 @@ _refresh_locks: dict[str, asyncio.Lock] = {}  # jti → lock guarding concurrent
 
 _google_token: ContextVar[str] = ContextVar("google_token", default="")
 _user_email: ContextVar[str] = ContextVar("user_email", default="")
+_read_only: ContextVar[bool] = ContextVar("read_only", default=False)
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -152,6 +168,23 @@ def _auth() -> dict:
     if not t:
         raise RuntimeError("not authenticated")
     return {"Authorization": f"Bearer {t}"}
+
+
+def _require_write() -> None:
+    if _read_only.get():
+        raise PermissionError("this connection is authorized read-only; write actions are disabled")
+
+
+def _alias_from_resource(resource: str | None) -> str:
+    """Extract the alias segment from an OAuth 'resource' parameter (RFC 8707), e.g.
+    https://host/work/mcp -> "work". Returns "" if absent/unparseable/unaliased —
+    same as an unrestricted connector."""
+    if not resource:
+        return ""
+    segments = urlparse(resource).path.strip("/").split("/")
+    if len(segments) == 2 and segments[1] == "mcp":
+        return segments[0]
+    return ""
 
 
 def _build_email(to: str, subject: str, body: str, cc: str = "",
@@ -243,6 +276,7 @@ async def read_thread(thread_id: str) -> dict:
 async def send_email(to: str, subject: str, body: str, cc: str = "",
                      reply_to_message_id: str = "") -> dict:
     """Send an email. Use reply_to_message_id to reply within a thread."""
+    _require_write()
     thread_id = ""
     in_reply_to = ""
     references = ""
@@ -272,6 +306,7 @@ async def send_email(to: str, subject: str, body: str, cc: str = "",
 @mcp.tool
 async def create_draft(to: str, subject: str, body: str, cc: str = "") -> dict:
     """Create a Gmail draft."""
+    _require_write()
     async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as c:
         r = await c.post(f"{GMAIL}/drafts", headers=_auth(),
                          json={"message": {"raw": _build_email(to, subject, body, cc)}})
@@ -302,6 +337,7 @@ async def list_labels() -> list[dict]:
 async def modify_labels(message_id: str, add: list[str] | None = None,
                         remove: list[str] | None = None) -> dict:
     """Add or remove labels on a Gmail message."""
+    _require_write()
     async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as c:
         r = await c.post(f"{GMAIL}/messages/{message_id}/modify", headers=_auth(),
                          json={"addLabelIds": add or [], "removeLabelIds": remove or []})
@@ -312,6 +348,7 @@ async def modify_labels(message_id: str, add: list[str] | None = None,
 @mcp.tool
 async def trash_message(message_id: str) -> dict:
     """Move a Gmail message to trash."""
+    _require_write()
     async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as c:
         r = await c.post(f"{GMAIL}/messages/{message_id}/trash", headers=_auth())
         r.raise_for_status()
@@ -405,11 +442,18 @@ async def _authorize(req: Request):
     if not p.get("code_challenge"):
         return Response("PKCE code_challenge is required", status_code=400)
 
+    resource = p.get("resource")
+    alias = _alias_from_resource(resource)
+    read_only = alias in READ_ONLY_ALIASES
+    log.info("authorize: alias=%r resource=%r -> %s", alias, resource,
+              "read-only" if read_only else "read-write")
+
     our_state = secrets.token_urlsafe(16)
     _state_store[our_state] = {
         "client_state": p.get("state"),
         "client_redirect_uri": redirect_uri,
         "code_challenge": p.get("code_challenge"),
+        "read_only": read_only,
         "created": time.time(),
     }
     return RedirectResponse(
@@ -417,7 +461,7 @@ async def _authorize(req: Request):
             "client_id": GOOGLE_CLIENT_ID,
             "redirect_uri": f"{BASE_URL}/auth/callback",
             "response_type": "code",
-            "scope": GOOGLE_SCOPES,
+            "scope": _google_scopes(read_only),
             "state": our_state,
             "access_type": "offline",
             "prompt": "consent",
@@ -456,13 +500,15 @@ async def _auth_callback(req: Request):
             return Response("Failed to fetch Google account info", status_code=502)
         userinfo = ui.json()
 
-    log.info("new session authenticated: %s", userinfo.get("email"))
+    log.info("new session authenticated: %s (read_only=%s)",
+             userinfo.get("email"), state_data.get("read_only", False))
     jti = secrets.token_urlsafe(16)
     _token_store[jti] = {
         "access_token": tokens["access_token"],
         "refresh_token": tokens.get("refresh_token"),
         "expiry": time.time() + tokens.get("expires_in", 3600),
         "email": userinfo.get("email"),
+        "read_only": state_data.get("read_only", False),
         # Provisional; replaced with the real 30-day expiry once /token mints the client JWT.
         # Ensures flows abandoned between here and /token still get purged.
         "jwt_exp": time.time() + STATE_TTL,
@@ -475,6 +521,7 @@ async def _auth_callback(req: Request):
         "code_challenge": state_data["code_challenge"],
         "client_redirect_uri": state_data["client_redirect_uri"],
         "client_state": state_data["client_state"],
+        "read_only": state_data.get("read_only", False),
         "created": time.time(),
     }
 
@@ -499,6 +546,7 @@ async def _token(req: Request) -> JSONResponse:
     token = jwt.encode({
         "jti": code_data["jti"],
         "email": code_data["email"],
+        "read_only": code_data.get("read_only", False),
         "iat": now,
         "exp": exp,
     }, JWT_SECRET, algorithm="HS256")
@@ -617,6 +665,7 @@ class _App:
                     return
                 _google_token.set(google_tok)
                 _user_email.set(payload.get("email", ""))
+                _read_only.set(payload.get("read_only", False))
 
             if path in _OAUTH_PATHS:
                 await self._oauth(scope, receive, send)
