@@ -33,6 +33,16 @@ JWT_SECRET = os.environ["JWT_SECRET"]
 HTTPX_TIMEOUT = 30.0
 STATE_TTL = 600  # seconds; abandoned OAuth flows are purged after this
 
+# Redirect URIs /authorize is allowed to send the auth code to. Without this allowlist,
+# an attacker can craft an /authorize?redirect_uri=<attacker-controlled> link and, once
+# the victim completes Google's consent screen, receive the resulting single-use code
+# themselves — full account takeover if PKCE isn't also enforced (see _authorize below).
+ALLOWED_REDIRECT_URIS = frozenset(
+    u.strip() for u in os.environ.get(
+        "ALLOWED_REDIRECT_URIS", "https://claude.ai/api/mcp/auth_callback"
+    ).split(",") if u.strip()
+)
+
 GOOGLE_SCOPES = " ".join([
     "openid",
     "https://www.googleapis.com/auth/userinfo.email",
@@ -51,7 +61,7 @@ GCAL = "https://www.googleapis.com/calendar/v3"
 # Fine for single-process personal use; restart clears sessions (re-auth needed).
 
 _state_store: dict[str, dict] = {}   # our_state  → {..., "created": ts}
-_code_store: dict[str, dict] = {}    # our_code   → {jti, email, code_challenge, ...}
+_code_store: dict[str, dict] = {}    # our_code   → {jti, email, code_challenge, ..., "created": ts}
 _token_store: dict[str, dict] = {}   # jti        → {access_token, refresh_token, expiry, email, jwt_exp}
 _refresh_locks: dict[str, asyncio.Lock] = {}  # jti → lock guarding concurrent token refreshes
 
@@ -76,6 +86,9 @@ def _purge_expired_states() -> None:
     expired = [k for k, v in _state_store.items() if now - v.get("created", now) > STATE_TTL]
     for k in expired:
         _state_store.pop(k, None)
+    expired = [k for k, v in _code_store.items() if now - v.get("created", now) > STATE_TTL]
+    for k in expired:
+        _code_store.pop(k, None)
 
 
 def _purge_expired_tokens() -> None:
@@ -226,12 +239,14 @@ async def send_email(to: str, subject: str, body: str, cc: str = "",
             r = await c.get(f"{GMAIL}/messages/{reply_to_message_id}", headers=_auth(),
                             params={"format": "metadata",
                                     "metadataHeaders": ["Message-ID", "References"]})
-            if r.is_success:
-                msg = r.json()
-                thread_id = msg.get("threadId", "")
-                hdrs = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
-                in_reply_to = hdrs.get("Message-ID", "")
-                references = (hdrs.get("References", "") + " " + in_reply_to).strip()
+            # Fail loudly rather than silently sending an unthreaded standalone email
+            # when the caller explicitly asked for a reply.
+            r.raise_for_status()
+            msg = r.json()
+            thread_id = msg.get("threadId", "")
+            hdrs = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
+            in_reply_to = hdrs.get("Message-ID", "")
+            references = (hdrs.get("References", "") + " " + in_reply_to).strip()
 
     payload: dict = {"raw": _build_email(to, subject, body, cc, in_reply_to, references)}
     if thread_id:
@@ -370,12 +385,18 @@ async def _protected_resource(req: Request) -> JSONResponse:
     })
 
 
-async def _authorize(req: Request) -> RedirectResponse:
+async def _authorize(req: Request):
     p = req.query_params
+    redirect_uri = p.get("redirect_uri", "https://claude.ai/api/mcp/auth_callback")
+    if redirect_uri not in ALLOWED_REDIRECT_URIS:
+        return Response("Unknown redirect_uri", status_code=400)
+    if not p.get("code_challenge"):
+        return Response("PKCE code_challenge is required", status_code=400)
+
     our_state = secrets.token_urlsafe(16)
     _state_store[our_state] = {
         "client_state": p.get("state"),
-        "client_redirect_uri": p.get("redirect_uri", "https://claude.ai/api/mcp/auth_callback"),
+        "client_redirect_uri": redirect_uri,
         "code_challenge": p.get("code_challenge"),
         "created": time.time(),
     }
@@ -437,6 +458,7 @@ async def _auth_callback(req: Request):
         "code_challenge": state_data["code_challenge"],
         "client_redirect_uri": state_data["client_redirect_uri"],
         "client_state": state_data["client_state"],
+        "created": time.time(),
     }
 
     params: dict = {"code": our_code}
@@ -452,9 +474,8 @@ async def _token(req: Request) -> JSONResponse:
         return JSONResponse({"error": "invalid_grant"}, status_code=400)
 
     verifier = data.get("code_verifier")
-    if code_data.get("code_challenge") and verifier:
-        if not _pkce_ok(verifier, code_data["code_challenge"]):
-            return JSONResponse({"error": "invalid_grant"}, status_code=400)
+    if not verifier or not _pkce_ok(verifier, code_data["code_challenge"]):
+        return JSONResponse({"error": "invalid_grant"}, status_code=400)
 
     now = int(time.time())
     exp = now + 86400 * 30
