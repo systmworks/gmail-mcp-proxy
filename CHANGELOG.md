@@ -3,6 +3,27 @@
 All notable changes to this project are documented here. Dated entries, keyed to
 commits — this repo isn't tagged/released, so there are no version numbers.
 
+## 2026-08-12 — Fix alias detection for per-alias read-only
+
+Verified live against a real deployment: connecting a `READ_ONLY_ALIASES`-restricted
+connector still requested full read/write scopes. Root cause traced from the deploy
+logs — `_protected_resource` always advertised the bare `BASE_URL` as the OAuth
+`resource`, regardless of which aliased connector the 401 challenge came from, so
+Claude correctly echoed that bare value back on `/authorize` and the alias never came
+through. Not a client-behavior gap — a bug in this server's own metadata.
+
+### Fixed
+- `/.well-known/oauth-protected-resource` and the 401 challenge's `resource_metadata`
+  URL are now alias-aware: the alias a request came in through is captured before
+  routing strips it (`_split_alias`, replacing `_normalise_path`) and threaded through
+  `scope["state"]` to the Starlette route handler, which echoes
+  `{BASE_URL}/{alias}/mcp` back as the resource. Claude then sends that same value as
+  the `resource` parameter on `/authorize`, which `_alias_from_resource` can parse
+  correctly.
+- `_protected_resource`'s `resource` field for the unaliased case also now points at
+  `{BASE_URL}/mcp` specifically rather than the bare origin, matching the RFC 9728
+  convention of identifying the actual protected resource, not just the server root.
+
 ## 2026-08-12 — Per-alias read-only access
 
 ### Added

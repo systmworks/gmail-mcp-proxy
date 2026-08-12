@@ -428,8 +428,14 @@ async def _openid_configuration(req: Request) -> JSONResponse:
 
 
 async def _protected_resource(req: Request) -> JSONResponse:
+    # The alias this was reached through (if any) — stashed into scope["state"] by
+    # _App.__call__ before the alias gets stripped for routing. Echoed back here so
+    # Claude's OAuth client round-trips it as the 'resource' param on /authorize,
+    # letting _authorize tell which aliased connector is authenticating.
+    alias = getattr(req.state, "alias", "")
+    resource = f"{BASE_URL}/{alias}/mcp" if alias else f"{BASE_URL}/mcp"
     return JSONResponse({
-        "resource": BASE_URL,
+        "resource": resource,
         "authorization_servers": [BASE_URL],
     })
 
@@ -560,10 +566,13 @@ async def _token(req: Request) -> JSONResponse:
 
 # ── Bearer auth middleware (raw ASGI — preserves ContextVar across await) ──────
 
-_WWW_AUTH = (
-    f'Bearer realm="Gmail MCP", '
-    f'resource_metadata="{BASE_URL}/.well-known/oauth-protected-resource"'
-).encode()
+def _www_auth_header(alias: str) -> bytes:
+    metadata_path = (f"/{alias}/.well-known/oauth-protected-resource" if alias
+                     else "/.well-known/oauth-protected-resource")
+    return (
+        f'Bearer realm="Gmail MCP", '
+        f'resource_metadata="{BASE_URL}{metadata_path}"'
+    ).encode()
 
 _OAUTH_PATHS = frozenset([
     "/.well-known/oauth-authorization-server",
@@ -596,17 +605,18 @@ def _with_security_headers(send):
     return wrapped
 
 
-def _normalise_path(path: str) -> str:
+def _split_alias(path: str) -> tuple[str, str]:
     """Strip a leading /<alias> segment so /personal/mcp, /work/.well-known/... etc.
-    resolve the same as their unaliased routes — lets two Claude connectors share one server."""
+    resolve the same as their unaliased routes — lets two Claude connectors share one
+    server. Returns (alias, normalised_path); alias is "" when there wasn't one."""
     if path in _KNOWN_PATHS or path.startswith("/mcp/"):
-        return path
+        return "", path
     segments = path.lstrip("/").split("/", 1)
     if len(segments) == 2:
         candidate = "/" + segments[1]
         if candidate in _KNOWN_PATHS or candidate.startswith("/mcp/"):
-            return candidate
-    return path
+            return segments[0], candidate
+    return "", path
 
 
 class _App:
@@ -637,31 +647,34 @@ class _App:
             except Exception:
                 log.exception("periodic cleanup failed")
 
-            path = _normalise_path(scope["path"])
+            alias, path = _split_alias(scope["path"])
             if path != scope["path"]:
                 scope = {**scope, "path": path, "raw_path": path.encode()}
+            # Starlette route handlers (e.g. _protected_resource) read this via
+            # req.state.alias to echo the alias back into OAuth discovery responses.
+            scope["state"] = {**(scope.get("state") or {}), "alias": alias}
 
             # Auth check for MCP endpoint only
             if path == "/mcp" or path.startswith("/mcp/"):
                 headers = dict(scope.get("headers", []))
                 auth = headers.get(b"authorization", b"").decode()
                 if not auth.startswith("Bearer "):
-                    await self._send_401(send)
+                    await self._send_401(send, alias)
                     return
                 try:
                     payload = jwt.decode(auth[7:], JWT_SECRET, algorithms=["HS256"])
                     google_tok = await _google_access_token(payload["jti"])
                 except jwt.PyJWTError as e:
                     log.info("rejected MCP request: invalid/expired JWT (%s)", e)
-                    await self._send_401(send)
+                    await self._send_401(send, alias)
                     return
                 except ReauthRequired as e:
                     log.warning("MCP request needs re-auth: %s", e)
-                    await self._send_401(send)
+                    await self._send_401(send, alias)
                     return
                 except Exception:
                     log.exception("unexpected error validating MCP request")
-                    await self._send_401(send)
+                    await self._send_401(send, alias)
                     return
                 _google_token.set(google_tok)
                 _user_email.set(payload.get("email", ""))
@@ -674,10 +687,10 @@ class _App:
         await self._mcp(scope, receive, send)
 
     @staticmethod
-    async def _send_401(send) -> None:
+    async def _send_401(send, alias: str = "") -> None:
         await send({"type": "http.response.start", "status": 401,
                     "headers": [(b"content-type", b"text/plain"),
-                                (b"www-authenticate", _WWW_AUTH)]})
+                                (b"www-authenticate", _www_auth_header(alias))]})
         await send({"type": "http.response.body", "body": b"Unauthorized"})
 
 
