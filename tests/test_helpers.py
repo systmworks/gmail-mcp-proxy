@@ -85,3 +85,28 @@ def test_client_raises_clear_error_before_lifespan_starts():
             server._client()
     finally:
         server._http_client = original
+
+
+def test_effective_read_only_true_when_jwt_says_so():
+    assert server._effective_read_only({"read_only": True}, "") is True
+
+
+def test_effective_read_only_true_when_alias_restricted_even_if_jwt_says_false():
+    # Regression test: a READ_ONLY_ALIASES-restricted connector must stay
+    # restricted even if the JWT was minted with read_only=False (e.g. the
+    # OAuth client never echoed the 'resource' param during /authorize).
+    original = server.READ_ONLY_ALIASES
+    server.READ_ONLY_ALIASES = frozenset({"work"})
+    try:
+        assert server._effective_read_only({"read_only": False}, "work") is True
+    finally:
+        server.READ_ONLY_ALIASES = original
+
+
+def test_effective_read_only_false_for_unrestricted_alias():
+    original = server.READ_ONLY_ALIASES
+    server.READ_ONLY_ALIASES = frozenset({"work"})
+    try:
+        assert server._effective_read_only({"read_only": False}, "personal") is False
+    finally:
+        server.READ_ONLY_ALIASES = original

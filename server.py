@@ -40,7 +40,10 @@ JWT_SECRET = os.environ["JWT_SECRET"]
 
 HTTPX_TIMEOUT = 30.0
 STATE_TTL = 600  # seconds; abandoned OAuth flows are purged after this
-SEARCH_ENRICH_LIMIT = 100  # max search_emails results to fetch metadata for per call
+# Max search_emails results to fetch metadata for per call. User-configurable —
+# direct token-cost/usefulness trade-off, see README. Clamped so a bad env value
+# can't silently disable enrichment or blow past Gmail's quota.
+SEARCH_ENRICH_LIMIT = max(0, min(200, int(os.environ.get("SEARCH_ENRICH_LIMIT", "20"))))
 
 # Redirect URIs /authorize is allowed to send the auth code to. Without this allowlist,
 # an attacker can craft an /authorize?redirect_uri=<attacker-controlled> link and, once
@@ -188,6 +191,15 @@ def _require_write() -> None:
         raise PermissionError("this connection is authorized read-only; write actions are disabled")
 
 
+def _effective_read_only(payload: dict, alias: str) -> bool:
+    """A restricted alias stays restricted even if the JWT itself says
+    read_only=False — e.g. because the OAuth client never echoed back the
+    'resource' parameter that read_only was originally decided from. `alias`
+    here comes from server-side path routing (_split_alias), not anything the
+    client asserts, so this can't be bypassed by client behavior."""
+    return payload.get("read_only", False) or alias in READ_ONLY_ALIASES
+
+
 def _alias_from_resource(resource: str | None) -> str:
     """Extract the alias segment from an OAuth 'resource' parameter (RFC 8707), e.g.
     https://host/work/mcp -> "work". Returns "" if absent/unparseable/unaliased —
@@ -231,9 +243,10 @@ async def get_profile() -> dict:
 @mcp.tool
 async def search_emails(query: str, max_results: int = 20) -> list[dict]:
     """Search Gmail. Supports all Gmail search operators (from:, subject:, has:attachment, etc.).
-    Each of the first 100 results includes from/to/subject/date/snippet/labels alongside
-    id/threadId, so most questions about the results don't need a follow-up read_message
-    call. Beyond 100 results, only id/threadId are included."""
+    Each of the first several results (deployment-configurable, default 20) includes
+    from/to/subject/date/snippet/labels alongside id/threadId, so most questions about the
+    results don't need a follow-up read_message call. Beyond that limit, only id/threadId
+    are included."""
     c = _client()
     r = await c.get(f"{GMAIL}/messages", headers=_auth(),
                     params={"q": query, "maxResults": max_results})
@@ -817,7 +830,7 @@ class _App:
                     return
                 _google_token.set(google_tok)
                 _user_email.set(payload.get("email", ""))
-                _read_only.set(payload.get("read_only", False))
+                _read_only.set(_effective_read_only(payload, alias))
 
             if path in _OAUTH_PATHS:
                 await self._oauth(scope, receive, send)

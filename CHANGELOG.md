@@ -6,13 +6,45 @@ serve release notes to), but working milestones get a lightweight git tag (`v0.1
 …) as a rollback anchor. A date heading only appears when the date changes from the
 entry above it.
 
+## 2026-08-14
+
+### 0.16 — Changelog trim pass
+
+Cut narrative walkthroughs and specific test-run figures from older entries;
+reduced repeated third-party project name-drops to a single mention. No
+functional change.
+
+### 0.15 — Configurable search_emails enrichment limit
+
+`SEARCH_ENRICH_LIMIT` was a hardcoded constant; made it an env var so
+deployments can tune the token-cost/usefulness trade-off without a code change.
+
+**Changed**
+- `SEARCH_ENRICH_LIMIT` env var, default `20` (was a hardcoded `100`), clamped
+  to 0–200.
+
+### 0.14 — Fail-closed per-alias read-only enforcement
+
+Found while reviewing upstream's independent port of this feature
+(devgar/gmail-mcp-proxy#5): read-only status was decided once at `/authorize`
+time from the client-supplied OAuth `resource` parameter and baked into the
+30-day JWT — if a client ever omitted or mishandled that parameter, a
+`READ_ONLY_ALIASES`-restricted connector would silently mint a full read/write
+JWT instead.
+
+**Fixed**
+- `_read_only` is now set from `payload.get("read_only", False) or alias in
+  READ_ONLY_ALIASES` (`_effective_read_only`), where `alias` comes from
+  server-side path routing (`_split_alias`) on the current request — not
+  anything the client asserts. A restricted alias can no longer silently
+  degrade to read/write.
+
 ## 2026-08-12
 
 ### 0.13 — Code quality review #4: shared HTTP client, search resilience, first tests
 
-Fourth review pass, this time comparing against ArtyMcLabin/Gmail-MCP-Server's
-own hardening approach for ideas. Found one real bug and one real efficiency
-problem; the rest were smaller robustness/staleness cleanups.
+Fourth code quality review. Found one real bug and one real efficiency problem;
+the rest were smaller robustness/staleness cleanups.
 
 **Fixed**
 - `search_emails`: a network-level exception (timeout, connection reset) enriching
@@ -48,14 +80,11 @@ problem; the rest were smaller robustness/staleness cleanups.
 
 ### 0.12 — Draft lifecycle, label CRUD, and report_phishing tools
 
-Closed the highest-value gaps found while comparing this project against
-ArtyMcLabin/Gmail-MCP-Server (an unrelated but much larger local-stdio Gmail MCP
-server): drafts could be created and listed but never sent, edited, or discarded
-through the tool surface; labels could be listed and toggled on messages but not
-created, renamed, or deleted; and marking a message as spam required knowing to call
-`modify_labels` with the `SPAM` system label directly rather than a purpose-named
-tool. No new OAuth scopes needed — `gmail.send`, `gmail.compose`, and `gmail.modify`
-(already requested) cover all seven additions.
+Closed the highest-value tool-surface gaps found comparing against
+ArtyMcLabin/Gmail-MCP-Server: draft lifecycle (create-only before), label CRUD
+(message-level toggle only before), and a named `report_phishing` tool. No new
+OAuth scopes needed — `gmail.send`/`compose`/`modify` already cover all seven
+additions.
 
 **Added**
 - `send_draft`, `update_draft`, `delete_draft` — full draft lifecycle, reusing the
@@ -71,24 +100,16 @@ tool. No new OAuth scopes needed — `gmail.send`, `gmail.compose`, and `gmail.m
 
 ### 0.11 — Raise search_emails enrichment cap to 100
 
-Verified against Google's own Gmail API quota docs before changing the number rather
-than guessing: per-user limit is 6,000 quota units/minute, `messages.get` costs 20
-units, `messages.list` costs 5. At the previous cap of 50, one fully-enriched search
-cost ~1,005 units (~6/minute of headroom); at 100 it's ~2,005 units (~3/minute) — still
-comfortable for normal usage. 200 was considered and rejected for now: a single turn
-with two enrichment-heavy searches back-to-back could brush the limit (degrades
-gracefully if so — individual failed fetches already fall back to bare id/threadId
-rather than erroring — but 100 has enough headroom not to worry about it).
+Verified against Google's Gmail API quota docs (6,000 units/min; `messages.get`=20,
+`messages.list`=5) before raising the cap — 100 stays well within budget for normal
+usage.
 
 **Changed**
-- `SEARCH_ENRICH_LIMIT`: 50 → 100. Would have covered all 84 messages in the search
-  that first surfaced the cutover, instead of dropping 34 to bare id/threadId.
+- `SEARCH_ENRICH_LIMIT`: 50 → 100.
 
 ### 0.10 — Code quality review #3
 
-Third review pass, specifically hunting for bugs, dead/stale code, and complexity not
-earning its keep. No new bugs found — this round is two small cleanups plus a written
-record of what was deliberately left alone (see the commit message for the full list).
+Third code quality review — two small cleanups, no new bugs found.
 
 **Changed**
 - `_oauth_server_metadata` and `_openid_configuration` shared 6 of 7 fields verbatim;
@@ -99,19 +120,16 @@ record of what was deliberately left alone (see the commit message for the full 
 
 ### 0.9 — Enrich search_emails results (2405ac8)
 
-Found during live testing: summarizing senders/subjects from search results required a
-separate read_message call per message, or narrower per-sender searches as a
-workaround — because Gmail's messages.list endpoint (which search_emails calls) has
-never returned anything beyond id/threadId. Not a bug, but a real usability gap worth
-closing.
+Gmail's `messages.list` (which `search_emails` calls) never returned more than
+id/threadId, forcing a separate `read_message` call just to see who a result was
+from.
 
 **Added**
 - `search_emails` now fetches from/to/subject/date/snippet/labels for the first 50
-  results (parallelized, reusing one HTTP connection) so most follow-up questions about
-  search results don't need a separate `read_message` call. Capped at 50 regardless of
-  `max_results` so a large explicit value can't fan out into hundreds of API calls;
-  results beyond the cap still come back as bare id/threadId. Individual fetch failures
-  fall back to the bare id/threadId for that message rather than failing the search.
+  results (parallelized, one shared connection), so most follow-ups don't need a
+  separate `read_message` call. Capped at 50 regardless of `max_results` (excess
+  results stay bare id/threadId); individual fetch failures degrade the same way
+  rather than failing the whole search.
 
 ### 0.8 — Railway + Google OAuth setup walkthrough (47636a0)
 
@@ -127,12 +145,9 @@ closing.
 
 ### 0.7 — Fix alias detection for per-alias read-only (46b28c4)
 
-Verified live against a real deployment: connecting a `READ_ONLY_ALIASES`-restricted
-connector still requested full read/write scopes. Root cause traced from the deploy
-logs — `_protected_resource` always advertised the bare `BASE_URL` as the OAuth
-`resource`, regardless of which aliased connector the 401 challenge came from, so
-Claude correctly echoed that bare value back on `/authorize` and the alias never came
-through. Not a client-behavior gap — a bug in this server's own metadata.
+`_protected_resource` always advertised the bare `BASE_URL` as the OAuth `resource`
+regardless of alias, so a `READ_ONLY_ALIASES`-restricted connector still requested
+full read/write scopes — a bug in this server's metadata, not client behavior.
 
 **Fixed**
 - `/.well-known/oauth-protected-resource` and the 401 challenge's `resource_metadata`

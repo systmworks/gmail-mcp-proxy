@@ -219,6 +219,7 @@ Note: `BASE_URL` must match the public path the proxy serves (e.g. `https://your
 | `ALLOWED_REDIRECT_URIS` | Optional. Comma-separated allowlist of OAuth redirect URIs `/authorize` will accept. Defaults to Claude.ai's callback (`https://claude.ai/api/mcp/auth_callback`) — only change this if you're connecting a non-Claude.ai MCP client. |
 | `LOG_LEVEL` | Optional. Python logging level (`INFO`, `WARNING`, `DEBUG`, etc.). Defaults to `INFO`. |
 | `READ_ONLY_ALIASES` | Optional. Comma-separated list of connector aliases (e.g. `work`) that should be restricted to read-only access — no send, draft, label changes, or trash. See below. |
+| `SEARCH_ENRICH_LIMIT` | Optional. How many `search_emails` results (0–200) get enriched with from/to/subject/date/snippet/labels instead of bare id/threadId. Defaults to `20`. Higher values mean richer search results at the cost of more tokens per search — see "Notes" below for the trade-off. |
 
 ## Read-only accounts
 
@@ -230,16 +231,20 @@ bug in this server can't make it send or delete anything; Google's API rejects i
 regardless. The server also refuses write tool calls itself with a clear error, as a
 second layer.
 
-**This depends on Claude sending the standard OAuth `resource` parameter** identifying
-which connector is authenticating, which MCP's authorization spec calls for but isn't
-something this project controls. After connecting a read-only-configured account, verify
-it actually took effect:
+**Enforcement is server-side and unconditional** — which alias a request comes in
+through is derived from the URL path on every single request, not something the
+client asserts, so a restricted alias stays restricted even if the OAuth client
+never echoes back the `resource` parameter during authorization. That parameter
+still affects which Google scopes get requested up front (best-effort
+minimization — a restricted account ideally never even gets asked to grant write
+scopes), so it's still worth confirming it worked:
 
 1. Check the server logs right after connecting — look for a line like
-   `authorize: alias='work' resource='...' -> read-only`. If `alias` comes back empty
-   instead, the restriction silently didn't apply for that connection, even though the
-   account was still granted read access — reconnect and check again, and if it keeps
-   happening, treat that alias as read/write for now.
+   `authorize: alias='work' resource='...' -> read-only`. If `alias` comes back
+   empty, Google still asked for full read/write scopes for that grant (the OAuth
+   client didn't send `resource`) — the tool-level restriction still applies
+   regardless, but reconnect and check again if you want the scope-minimization
+   layer working too.
 2. Ask Claude, through that connector, to send a test email or trash a message. It
    should be refused.
 
@@ -260,3 +265,8 @@ and read-only enforcement. No live Google credentials needed to run them.
 - Sessions are stored in memory — a server restart requires re-authentication in Claude.ai
 - Google access tokens are refreshed automatically using the stored refresh token
 - The server issues 30-day JWTs; Claude re-authenticates when they expire
+- `SEARCH_ENRICH_LIMIT` trades tokens for fewer round-trips: each enriched result
+  costs a few hundred tokens, which pays off when you're scanning many results at
+  once, but is wasted on results you never look at. `read_message` is unaffected
+  either way — it returns a message's full decoded text body regardless (not
+  attachments), so it's the more expensive call per-message, just not per-search.
