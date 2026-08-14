@@ -1,3 +1,5 @@
+[← Back to README](README.md)
+
 # Changelog
 
 All notable changes to this project, in version order — starting at 0.1 for the
