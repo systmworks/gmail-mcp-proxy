@@ -4,7 +4,7 @@ Self-hosted [MCP](https://modelcontextprotocol.io) server that exposes Gmail and
 
 ## Quick Links
 
-- [Setup](setup.md) — Railway deployment walkthrough and self-hosting instructions
+- [Setup](SETUP.md) — Railway deployment walkthrough and self-hosting instructions
 - [Changelog](CHANGELOG.md) — version history
 
 ## How it works
@@ -49,9 +49,9 @@ The server acts as an OAuth proxy: it presents itself as an OAuth 2.0 authorizat
 - A GitHub account with this repo forked (or cloned) into it
 - A Google Cloud project (free) — used only to issue OAuth credentials, no billing needed
 - A place to run the server with HTTPS — a PaaS platform (Railway, Render, etc.) is the
-  easiest path and covered step by step in [Setup](setup.md); Python 3.12+ or Docker
+  easiest path and covered step by step in [Setup](SETUP.md); Python 3.12+ or Docker
   for self-hosting behind your own reverse proxy also work (see
-  [Setup](setup.md#self-hosting))
+  [Setup](SETUP.md#self-hosting))
 
 ## Configuration
 
