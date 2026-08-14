@@ -2,11 +2,16 @@
 
 # Changelog
 
-All notable changes to this project, in version order — starting at 0.1 for the
-original fork and incrementing from there. No GitHub Releases (no external consumers to
-serve release notes to), but working milestones get a lightweight git tag (`v0.1`, `v0.2`,
-…) as a rollback anchor. A date heading only appears when the date changes from the
-entry above it.
+All notable **code changes** to this project — `server.py` and the test suite — in
+version order, starting at 0.1 for the original fork and incrementing from there.
+Administrative changes (documentation, README/SETUP.md, CI/tooling config, LICENSE,
+dependency pins, changelog maintenance itself, etc.) are tracked in git commit
+history only, not here. Version numbers are permanent once assigned — removing an
+out-of-scope entry leaves a gap rather than renumbering everything after it, so a
+missing number means an administrative-only change, not a lost entry. No GitHub
+Releases (no external consumers to serve release notes to), but working milestones
+get a lightweight git tag (`v0.1`, `v0.2`, …) as a rollback anchor. A date heading
+only appears when the date changes from the entry above it.
 
 ## 2026-08-14
 
@@ -29,9 +34,9 @@ failure path logged anything, so there was no way to diagnose it after the fact.
 - `tests/test_server.py`: coverage for retry-then-recover, retry-then-still-fails
   (bounded at one retry), and no-retry-on-permanent-4xx.
 
-### 0.22 — Auth header hardening, LICENSE, and review nits
+### 0.22 — Harden malformed Authorization header handling
 
-Fifth code quality review found one real robustness gap and a handful of docs/config cleanups.
+Fifth code quality review found one real robustness gap.
 
 **Fixed**
 - `_App.__call__`: non-UTF-8 bytes in the `Authorization` header raised an uncaught
@@ -39,24 +44,6 @@ Fifth code quality review found one real robustness gap and a handful of docs/co
   this function gets. Now decodes with `errors="replace"`.
 - Deduplicated the default redirect URI (`https://claude.ai/api/mcp/auth_callback`),
   previously hardcoded in two places, into one `DEFAULT_REDIRECT_URI` constant.
-
-**Added**
-- `LICENSE` — MIT. Neither this repo nor upstream (`devgar/gmail-mcp-proxy`) has ever
-  had one.
-- `requirements.txt`: comment explaining `fastmcp`'s exact pin, unlike the
-  range-pinned deps around it.
-- README: Development section now lists `ruff check`/`mypy` alongside `pytest`,
-  matching what CI actually runs. Found while reviewing upstream's independent
-  addition of the same thing (`devgar/gmail-mcp-proxy@84f2d23`, via #10) — this fork
-  had already adopted the underlying CI workflow from that same upstream change
-  (0.19 below) but missed the README half.
-- README: Notes bullet warning against multiple Railway replicas/`uvicorn --workers`
-  given in-memory session state.
-
-**Changed**
-- setup.md: fixed a heading-level skip (`## Self-hosting` → `#### Docker Compose
-  example`, now `###`) and a redundant `# Setup` / `## Setup (Railway)` pairing
-  (now `## Railway`).
 
 ### 0.21 — OAuth flow test coverage
 
@@ -68,52 +55,6 @@ security fixes (0.4, 0.7, 0.14).
 - `tests/test_oauth_flow.py` — redirect_uri/PKCE validation, the authorize → callback
   → token handoff (mocked via `respx`), refresh success/failure/concurrency-lock
   behavior, and 401 handling plus alias routing on `/mcp`.
-
-### 0.20 — Split Setup/Self-hosting into setup.md, restructure README
-
-README had grown to 273 lines with one-time deployment instructions (Railway
-walkthrough, self-hosting, Docker Compose, nginx config) sitting between the
-quick-reference material a returning user actually needs.
-
-**Changed**
-- New `setup.md`: Railway walkthrough + self-hosting moved here verbatim, with a
-  back-link to README.
-- README: new Quick Links section (Setup, Changelog); Configuration now sits
-  directly below Prerequisites. Folded the `SEARCH_ENRICH_LIMIT` token-cost
-  trade-off into its Configuration row; added a table listing which fields a
-  simple vs. enriched `search_emails` result contains; fixed the Tools table's
-  stale "first 100 results" line (default's been 20 since the configurable-limit
-  change).
-
-### 0.19 — CI: run pytest, ruff and mypy on every push and PR
-
-Adopted from `devgar/gmail-mcp-proxy`. Runs the test suite on Python 3.12/3.13/3.14
-(3.12 matches the Docker image; the others catch breakage early) plus a separate
-ruff+mypy lint job.
-
-**Added**
-- `.github/workflows/ci.yml`.
-- `requirements-dev.txt` now includes `ruff`/`mypy` so the lint job's install step
-  covers them — previously these were only run manually, ad hoc.
-
-### 0.18 — Centralize ruff/mypy config in pyproject.toml
-
-Catching up the changelog: this and the two entries above it (0.19, 0.20 — followed
-later the same day by 0.21, 0.22) cover `d306038`, `5ae8055`, and `af3b97c`, which
-shipped without changelog entries. Adopted from `devgar/gmail-mcp-proxy` (tool config
-only, not the full uv packaging migration — that's still pending upstream too).
-Replaces the ad-hoc `ruff --select` flags and `--ignore-missing-imports` passed by
-hand each session with a checked-in config, broadening the ruff rule set
-(import-sorting, pyupgrade) and mypy's warnings (unreachable code, redundant casts,
-unused ignores).
-
-**Fixed**
-- `os.environ.get("PORT", 8000)` had an int default where `os.environ.get` expects
-  `str | None` (`PLW1508`) — harmless since `int()` wraps it either way, but
-  inconsistent; default changed to `"8000"`.
-
-**Added**
-- `[tool.ruff]` / `[tool.mypy]` config in `pyproject.toml`.
 
 ### 0.17 — Fix /token crash on multipart form data
 
@@ -129,12 +70,6 @@ field crashed with an unhandled `AttributeError` (500) instead of a clean 400.
 **Added**
 - `tests/test_token.py` — first direct test coverage for the `/token`
   endpoint, including a regression test for the crash above.
-
-### 0.16 — Changelog trim pass
-
-Cut narrative walkthroughs and specific test-run figures from older entries;
-reduced repeated third-party project name-drops to a single mention. No
-functional change.
 
 ### 0.15 — Configurable search_emails enrichment limit
 
@@ -187,9 +122,6 @@ the rest were smaller robustness/staleness cleanups.
 - `read_message`: `_extract_body` walked the MIME part tree twice (once for
   text/plain, once for text/html on fallback). Replaced with a single recursive
   pass (`_find_bodies`) that collects both and prefers plain.
-- `.env.example` and a `server.py` comment: replaced the leftover
-  `mcp.gar.im` example domain (inherited from the upstream fork point) with a
-  generic placeholder — README's own example was already generic.
 
 **Added**
 - First test suite for the project: `tests/`, `pytest.ini`, `requirements-dev.txt`.
@@ -236,9 +168,6 @@ Third code quality review — two small cleanups, no new bugs found.
 **Changed**
 - `_oauth_server_metadata` and `_openid_configuration` shared 6 of 7 fields verbatim;
   extracted into `_base_oauth_metadata()`.
-- `.env.example` now lists `ALLOWED_REDIRECT_URIS`, `LOG_LEVEL`, `READ_ONLY_ALIASES` —
-  all three were added earlier today but never added here, so they were easy to miss
-  when setting up a new deployment.
 
 ### 0.9 — Enrich search_emails results (2405ac8)
 
@@ -252,18 +181,6 @@ from.
   separate `read_message` call. Capped at 50 regardless of `max_results` (excess
   results stay bare id/threadId); individual fetch failures degrade the same way
   rather than failing the whole search.
-
-### 0.8 — Railway + Google OAuth setup walkthrough (47636a0)
-
-**Changed**
-- Rewrote the Setup section as a step-by-step Railway + Google Cloud walkthrough based
-  on an actual live deployment, including the non-obvious parts: the first deploy
-  crashing before env vars are set, Railway's target-port prompt being safe to leave at
-  default, current Google Cloud Console navigation (Audience/Clients under "Google Auth
-  Platform", APIs & Services/Library being separate), the test-user "ineligible" gotcha,
-  and the OAuth Client ID placeholder needed to skip past Claude's
-  automatic-registration warning. Self-hosting (Docker/reverse proxy) instructions kept
-  as a secondary path rather than removed.
 
 ### 0.7 — Fix alias detection for per-alias read-only (46b28c4)
 
@@ -310,8 +227,6 @@ full read/write scopes — a bug in this server's metadata, not client behavior.
   (`hmac.compare_digest`) instead of `==`.
 - Added standard security response headers (`Strict-Transport-Security`,
   `X-Content-Type-Options`, `X-Frame-Options`) to every response.
-- Docker image now runs as a non-root user.
-- `requirements.txt` now has upper version bounds on all floor-pinned dependencies.
 
 **Added**
 - Structured logging throughout the OAuth flow and the bearer-auth check, so failures
@@ -338,13 +253,6 @@ full read/write scopes — a bug in this server's metadata, not client behavior.
   now expire after 10 minutes instead of leaking forever.
 - `send_email` now raises an error instead of silently sending an unthreaded standalone
   email when `reply_to_message_id` was given but the lookup failed.
-
-**Changed**
-- `requirements.txt` now lists `starlette` and `uvicorn` directly instead of relying on
-  them arriving transitively via `fastmcp`.
-- README: fixed a stale/incorrect clone URL, added a Railway/Render deployment section,
-  documented `ALLOWED_REDIRECT_URIS`.
-- Removed a stray unrelated entry (`con.yml`) from `.gitignore`.
 
 ### 0.3 — Platform port binding (19b1d1d)
 
@@ -377,5 +285,4 @@ full read/write scopes — a bug in this server's metadata, not client behavior.
 
 ### 0.1 — Forked from devgar/gmail-mcp-proxy (2d92cbf)
 
-Starting point for everything above: the original project as forked, including its
-README and deployment docs (added 2026-06-15, shortly after the initial commit).
+Starting point for everything above: the original project as forked.
