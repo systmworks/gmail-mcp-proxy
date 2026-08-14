@@ -62,6 +62,52 @@ async def test_search_emails_degrades_on_http_error_status():
 
 
 @respx.mock
+async def test_search_emails_retries_and_recovers_from_transient_5xx():
+    respx.get(f"{server.GMAIL}/messages").mock(
+        return_value=httpx.Response(200, json={"messages": [{"id": "1", "threadId": "t1"}]})
+    )
+    route = respx.get(f"{server.GMAIL}/messages/1").mock(side_effect=[
+        httpx.Response(500),
+        httpx.Response(200, json={
+            "snippet": "hi",
+            "labelIds": ["INBOX"],
+            "payload": {"headers": [{"name": "From", "value": "a@example.com"}]},
+        }),
+    ])
+
+    results = await server.search_emails("test query")
+
+    assert route.call_count == 2
+    assert results[0]["from"] == "a@example.com"
+
+
+@respx.mock
+async def test_search_emails_gives_up_after_one_retry_on_persistent_failure():
+    respx.get(f"{server.GMAIL}/messages").mock(
+        return_value=httpx.Response(200, json={"messages": [{"id": "1", "threadId": "t1"}]})
+    )
+    route = respx.get(f"{server.GMAIL}/messages/1").mock(return_value=httpx.Response(503))
+
+    results = await server.search_emails("test query")
+
+    assert route.call_count == 2
+    assert results == [{"id": "1", "threadId": "t1"}]
+
+
+@respx.mock
+async def test_search_emails_does_not_retry_permanent_4xx():
+    respx.get(f"{server.GMAIL}/messages").mock(
+        return_value=httpx.Response(200, json={"messages": [{"id": "1", "threadId": "t1"}]})
+    )
+    route = respx.get(f"{server.GMAIL}/messages/1").mock(return_value=httpx.Response(404))
+
+    results = await server.search_emails("test query")
+
+    assert route.call_count == 1
+    assert results == [{"id": "1", "threadId": "t1"}]
+
+
+@respx.mock
 async def test_read_message_prefers_plain_over_html():
     payload = {
         "id": "123", "threadId": "t123", "snippet": "hi", "labelIds": ["INBOX"],

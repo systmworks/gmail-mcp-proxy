@@ -10,6 +10,25 @@ entry above it.
 
 ## 2026-08-14
 
+### 0.24 — Retry transient search_emails enrichment failures, log persistent ones
+
+Live testing showed a meaningful fraction of `search_emails`' concurrent per-message
+enrichment calls failing on any given run, with different messages failing each
+time — the signature of a transient issue, not permanently broken messages. Neither
+failure path logged anything, so there was no way to diagnose it after the fact.
+
+**Fixed**
+- `_enrich` retries once on network errors and retryable HTTP statuses (`429`, `5xx`)
+  before degrading to bare `id`/`threadId` — most of these clear up on an immediate
+  retry. Other 4xx (403/404, etc.) are treated as permanent and not retried.
+
+**Added**
+- Both failure paths in `_enrich` now log a `log.warning` with the message ID and the
+  actual reason (exception message, or HTTP status + truncated body), noting whether
+  it happened after a retry.
+- `tests/test_server.py`: coverage for retry-then-recover, retry-then-still-fails
+  (bounded at one retry), and no-retry-on-permanent-4xx.
+
 ### 0.22 — Auth header hardening, LICENSE, and review nits
 
 Fifth code quality review found one real robustness gap and a handful of docs/config cleanups.

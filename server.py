@@ -86,6 +86,10 @@ def _google_scopes(read_only: bool) -> str:
 GMAIL = "https://gmail.googleapis.com/gmail/v1/users/me"
 GCAL = "https://www.googleapis.com/calendar/v3"
 
+# search_emails' per-message enrichment retries once on these — rate limiting and
+# server errors are usually transient. Other 4xx (403/404, etc.) are permanent.
+_RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
+
 # Shared connection-pooled client for all outbound Gmail/Calendar/Google OAuth requests.
 # Created/closed around the ASGI lifespan in _App.__call__ — avoids paying a fresh
 # TCP+TLS handshake to googleapis.com on every single tool call.
@@ -257,17 +261,33 @@ async def search_emails(query: str, max_results: int = 20) -> list[dict]:
 
     to_enrich, rest = messages[:SEARCH_ENRICH_LIMIT], messages[SEARCH_ENRICH_LIMIT:]
 
-    async def _enrich(msg: dict) -> dict:
+    async def _fetch_metadata(message_id: str) -> httpx.Response | None:
         try:
-            er = await c.get(f"{GMAIL}/messages/{msg['id']}", headers=_auth(),
-                             params={"format": "metadata",
-                                     "metadataHeaders": ["From", "To", "Subject", "Date"]})
+            return await c.get(f"{GMAIL}/messages/{message_id}", headers=_auth(),
+                               params={"format": "metadata",
+                                       "metadataHeaders": ["From", "To", "Subject", "Date"]})
         except httpx.HTTPError:
-            # Network-level failure (timeout, connection reset, etc.) for this one
-            # message — degrade to bare id/threadId rather than failing the whole
-            # search, same as the is_success check below already does for HTTP errors.
+            return None
+
+    async def _enrich(msg: dict) -> dict:
+        er = await _fetch_metadata(msg["id"])
+        retried = False
+        if er is None or er.status_code in _RETRYABLE_STATUSES:
+            # Network errors, rate limiting, and server errors are usually transient
+            # (confirmed empirically: most messages that fail here succeed on an
+            # immediate retry) — retry once before degrading. Other 4xx (403/404,
+            # etc.) are permanent and not worth a second call.
+            retried = True
+            er = await _fetch_metadata(msg["id"])
+
+        if er is None:
+            log.warning("search_emails: enrich failed for %s (network error%s)",
+                        msg["id"], ", after retry" if retried else "")
             return msg
         if not er.is_success:
+            log.warning("search_emails: enrich failed for %s (HTTP %s%s): %s",
+                        msg["id"], er.status_code, ", after retry" if retried else "",
+                        er.text[:200])
             return msg
         data = er.json()
         hdrs = {h["name"]: h["value"] for h in data.get("payload", {}).get("headers", [])}
