@@ -855,4 +855,4 @@ app = _App()
 if __name__ == "__main__":
     import uvicorn
     # PaaS platforms (Railway, Render, etc.) inject PORT and route to whatever it's set to.
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), log_level="info")
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8000")), log_level="info")
