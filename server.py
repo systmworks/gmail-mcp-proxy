@@ -685,7 +685,11 @@ async def _auth_callback(req: Request):
 
 
 async def _token(req: Request) -> JSONResponse:
-    data = await req.form()
+    form = await req.form()
+    # Starlette form values are `UploadFile | str`. A client posting multipart (or a
+    # scanner doing so) previously reached _pkce_ok with an UploadFile and crashed it on
+    # .encode(); treat any non-string value as absent so those requests get a clean 400.
+    data = {k: v for k, v in form.multi_items() if isinstance(v, str)}
     code_data = _code_store.pop(data.get("code", ""), None)
     if not code_data:
         return JSONResponse({"error": "invalid_grant"}, status_code=400)

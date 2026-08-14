@@ -8,6 +8,21 @@ entry above it.
 
 ## 2026-08-14
 
+### 0.17 — Fix /token crash on multipart form data
+
+Starlette form values are `UploadFile | str`. `_token` passed `code_verifier`
+straight to `_pkce_ok`, which calls `.encode()` on it — a client posting
+`/token` as multipart with `code_verifier` as a file part instead of a plain
+field crashed with an unhandled `AttributeError` (500) instead of a clean 400.
+
+**Fixed**
+- `_token` now filters form values to strings only before use, so any
+  non-string field is treated as absent rather than crashing.
+
+**Added**
+- `tests/test_token.py` — first direct test coverage for the `/token`
+  endpoint, including a regression test for the crash above.
+
 ### 0.16 — Changelog trim pass
 
 Cut narrative walkthroughs and specific test-run figures from older entries;
