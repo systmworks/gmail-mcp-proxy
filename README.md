@@ -108,7 +108,9 @@ scopes), so it's still worth confirming it worked:
 
 ```bash
 pip install -r requirements-dev.txt
-pytest
+pytest          # test suite
+ruff check .    # lint
+mypy            # type check (config in pyproject.toml)
 ```
 
 Tests mock all Gmail/Calendar API calls (via `respx`) and cover the pure-logic
@@ -119,5 +121,8 @@ and read-only enforcement. No live Google credentials needed to run them.
 ## Notes
 
 - Sessions are stored in memory — a server restart requires re-authentication in Claude.ai
+- Runs as a single process — don't scale to multiple Railway replicas or `uvicorn --workers N`.
+  Session/state stores are per-process in-memory, so a request landing on a different
+  process than the one that authenticated it would fail as if unauthenticated.
 - Google access tokens are refreshed automatically using the stored refresh token
 - The server issues 30-day JWTs; Claude re-authenticates when they expire

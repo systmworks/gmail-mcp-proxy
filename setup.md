@@ -2,7 +2,7 @@
 
 # Setup
 
-## Setup (Railway)
+## Railway
 
 This is the full walkthrough, in the order that actually works — including the
 non-obvious steps. Railway is used as the example; Render or any similar platform works
@@ -121,7 +121,7 @@ Put it behind any reverse proxy that terminates HTTPS (Caddy, nginx, Traefik, �
 forwards `https://<your-domain>/gmail` to the container's port `8000` — set `PORT=8000`
 in `.env` to match, or leave `PORT` unset since `8000` is the default.
 
-#### Docker Compose example
+### Docker Compose example
 
 A minimal `compose.yml` to run the container — uncomment the labels for whichever proxy you use:
 

@@ -243,6 +243,25 @@ async def test_mcp_endpoint_rejects_non_bearer_scheme(asgi_client):
     assert r.status_code == 401
 
 
+async def test_mcp_endpoint_rejects_malformed_non_utf8_header_cleanly():
+    # Regression test: non-UTF-8 bytes in the Authorization header used to raise
+    # an uncaught UnicodeDecodeError instead of the clean 401 every other
+    # malformed-input case in this function gets. Drives the raw ASGI scope
+    # directly — httpx's own header encoding won't reproduce invalid UTF-8 bytes.
+    scope = {"type": "http", "path": "/mcp", "headers": [(b"authorization", b"Bearer \xff\xfe")]}
+    sent = []
+
+    async def receive():
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        sent.append(message)
+
+    await server.app(scope, receive, send)
+
+    assert sent[0]["status"] == 401
+
+
 async def test_mcp_endpoint_rejects_invalid_jwt(asgi_client):
     r = await asgi_client.get("/mcp", headers={"Authorization": "Bearer not-a-real-jwt"})
     assert r.status_code == 401

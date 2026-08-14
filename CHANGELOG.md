@@ -10,6 +10,92 @@ entry above it.
 
 ## 2026-08-14
 
+### 0.22 — Auth header hardening, LICENSE, and review nits
+
+Fifth code quality review found one real robustness gap and a handful of docs/config cleanups.
+
+**Fixed**
+- `_App.__call__`: non-UTF-8 bytes in the `Authorization` header raised an uncaught
+  `UnicodeDecodeError` instead of the clean 401 every other malformed-input case in
+  this function gets. Now decodes with `errors="replace"`.
+- Deduplicated the default redirect URI (`https://claude.ai/api/mcp/auth_callback`),
+  previously hardcoded in two places, into one `DEFAULT_REDIRECT_URI` constant.
+
+**Added**
+- `LICENSE` — MIT. Neither this repo nor upstream (`devgar/gmail-mcp-proxy`) has ever
+  had one.
+- `requirements.txt`: comment explaining `fastmcp`'s exact pin, unlike the
+  range-pinned deps around it.
+- README: Development section now lists `ruff check`/`mypy` alongside `pytest`,
+  matching what CI actually runs. Found while reviewing upstream's independent
+  addition of the same thing (`devgar/gmail-mcp-proxy@84f2d23`, via #10) — this fork
+  had already adopted the underlying CI workflow from that same upstream change
+  (0.19 below) but missed the README half.
+- README: Notes bullet warning against multiple Railway replicas/`uvicorn --workers`
+  given in-memory session state.
+
+**Changed**
+- setup.md: fixed a heading-level skip (`## Self-hosting` → `#### Docker Compose
+  example`, now `###`) and a redundant `# Setup` / `## Setup (Railway)` pairing
+  (now `## Railway`).
+
+### 0.21 — OAuth flow test coverage
+
+Zero test coverage existed for `_authorize`, `_auth_callback`, `_refresh`, or the
+bearer-auth/JWT branch of `_App.__call__` — the exact code that's had three prior
+security fixes (0.4, 0.7, 0.14).
+
+**Added**
+- `tests/test_oauth_flow.py` — redirect_uri/PKCE validation, the authorize → callback
+  → token handoff (mocked via `respx`), refresh success/failure/concurrency-lock
+  behavior, and 401 handling plus alias routing on `/mcp`.
+
+### 0.20 — Split Setup/Self-hosting into setup.md, restructure README
+
+README had grown to 273 lines with one-time deployment instructions (Railway
+walkthrough, self-hosting, Docker Compose, nginx config) sitting between the
+quick-reference material a returning user actually needs.
+
+**Changed**
+- New `setup.md`: Railway walkthrough + self-hosting moved here verbatim, with a
+  back-link to README.
+- README: new Quick Links section (Setup, Changelog); Configuration now sits
+  directly below Prerequisites. Folded the `SEARCH_ENRICH_LIMIT` token-cost
+  trade-off into its Configuration row; added a table listing which fields a
+  simple vs. enriched `search_emails` result contains; fixed the Tools table's
+  stale "first 100 results" line (default's been 20 since the configurable-limit
+  change).
+
+### 0.19 — CI: run pytest, ruff and mypy on every push and PR
+
+Adopted from `devgar/gmail-mcp-proxy`. Runs the test suite on Python 3.12/3.13/3.14
+(3.12 matches the Docker image; the others catch breakage early) plus a separate
+ruff+mypy lint job.
+
+**Added**
+- `.github/workflows/ci.yml`.
+- `requirements-dev.txt` now includes `ruff`/`mypy` so the lint job's install step
+  covers them — previously these were only run manually, ad hoc.
+
+### 0.18 — Centralize ruff/mypy config in pyproject.toml
+
+Catching up the changelog: this and the two entries above it (0.19, 0.20 — followed
+later the same day by 0.21, 0.22) cover `d306038`, `5ae8055`, and `af3b97c`, which
+shipped without changelog entries. Adopted from `devgar/gmail-mcp-proxy` (tool config
+only, not the full uv packaging migration — that's still pending upstream too).
+Replaces the ad-hoc `ruff --select` flags and `--ignore-missing-imports` passed by
+hand each session with a checked-in config, broadening the ruff rule set
+(import-sorting, pyupgrade) and mypy's warnings (unreachable code, redundant casts,
+unused ignores).
+
+**Fixed**
+- `os.environ.get("PORT", 8000)` had an int default where `os.environ.get` expects
+  `str | None` (`PLW1508`) — harmless since `int()` wraps it either way, but
+  inconsistent; default changed to `"8000"`.
+
+**Added**
+- `[tool.ruff]` / `[tool.mypy]` config in `pyproject.toml`.
+
 ### 0.17 — Fix /token crash on multipart form data
 
 Starlette form values are `UploadFile | str`. `_token` passed `code_verifier`

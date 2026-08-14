@@ -45,13 +45,15 @@ STATE_TTL = 600  # seconds; abandoned OAuth flows are purged after this
 # can't silently disable enrichment or blow past Gmail's quota.
 SEARCH_ENRICH_LIMIT = max(0, min(200, int(os.environ.get("SEARCH_ENRICH_LIMIT", "20"))))
 
+DEFAULT_REDIRECT_URI = "https://claude.ai/api/mcp/auth_callback"
+
 # Redirect URIs /authorize is allowed to send the auth code to. Without this allowlist,
 # an attacker can craft an /authorize?redirect_uri=<attacker-controlled> link and, once
 # the victim completes Google's consent screen, receive the resulting single-use code
 # themselves — full account takeover if PKCE isn't also enforced (see _authorize below).
 ALLOWED_REDIRECT_URIS = frozenset(
     u.strip() for u in os.environ.get(
-        "ALLOWED_REDIRECT_URIS", "https://claude.ai/api/mcp/auth_callback"
+        "ALLOWED_REDIRECT_URIS", DEFAULT_REDIRECT_URI
     ).split(",") if u.strip()
 )
 
@@ -589,7 +591,7 @@ async def _protected_resource(req: Request) -> JSONResponse:
 
 async def _authorize(req: Request):
     p = req.query_params
-    redirect_uri = p.get("redirect_uri", "https://claude.ai/api/mcp/auth_callback")
+    redirect_uri = p.get("redirect_uri", DEFAULT_REDIRECT_URI)
     if redirect_uri not in ALLOWED_REDIRECT_URIS:
         return Response("Unknown redirect_uri", status_code=400)
     if not p.get("code_challenge"):
@@ -813,7 +815,7 @@ class _App:
             # Auth check for MCP endpoint only
             if path == "/mcp" or path.startswith("/mcp/"):
                 headers = dict(scope.get("headers", []))
-                auth = headers.get(b"authorization", b"").decode()
+                auth = headers.get(b"authorization", b"").decode("utf-8", errors="replace")
                 if not auth.startswith("Bearer "):
                     await self._send_401(send, alias)
                     return
