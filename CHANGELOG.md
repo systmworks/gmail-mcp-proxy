@@ -13,6 +13,25 @@ Releases (no external consumers to serve release notes to), but working mileston
 get a lightweight git tag (`v0.1`, `v0.2`, …) as a rollback anchor. A date heading
 only appears when the date changes from the entry above it.
 
+## 2026-09-08
+
+### 0.26 — Configurable search_emails enrichment retry count
+
+Self-hosted deployment saw ~50% of a 20-message enrichment batch fail even
+with the single built-in retry (0.24), typically recovering by a 3rd manual
+re-run — the fixed 1-retry budget wasn't enough for that network's failure
+rate under batch concurrency.
+
+**Changed**
+- `_enrich` now retries up to `SEARCH_ENRICH_ATTEMPTS` total tries (env var,
+  default `2` — same as before), with a short delay between attempts, before
+  falling back to bare id/threadId. Permanent 4xx still stops retrying
+  immediately.
+
+**Added**
+- `tests/test_server.py`: coverage for a 3-attempt configuration recovering
+  on the 3rd try.
+
 ## 2026-09-07
 
 ### 0.25 — Log token expiry/refresh decisions

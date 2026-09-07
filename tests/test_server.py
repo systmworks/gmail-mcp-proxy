@@ -82,6 +82,35 @@ async def test_search_emails_retries_and_recovers_from_transient_5xx():
 
 
 @respx.mock
+async def test_search_emails_respects_configured_attempt_count():
+    # Regression coverage for SEARCH_ENRICH_ATTEMPTS: a deployment that sees more
+    # transient failures than the default (2 total attempts) recovers can raise
+    # this to retry further before degrading.
+    original = server.SEARCH_ENRICH_ATTEMPTS
+    server.SEARCH_ENRICH_ATTEMPTS = 3
+    try:
+        respx.get(f"{server.GMAIL}/messages").mock(
+            return_value=httpx.Response(200, json={"messages": [{"id": "1", "threadId": "t1"}]})
+        )
+        route = respx.get(f"{server.GMAIL}/messages/1").mock(side_effect=[
+            httpx.Response(500),
+            httpx.Response(503),
+            httpx.Response(200, json={
+                "snippet": "hi",
+                "labelIds": ["INBOX"],
+                "payload": {"headers": [{"name": "From", "value": "a@example.com"}]},
+            }),
+        ])
+
+        results = await server.search_emails("test query")
+
+        assert route.call_count == 3
+        assert results[0]["from"] == "a@example.com"
+    finally:
+        server.SEARCH_ENRICH_ATTEMPTS = original
+
+
+@respx.mock
 async def test_search_emails_gives_up_after_one_retry_on_persistent_failure():
     respx.get(f"{server.GMAIL}/messages").mock(
         return_value=httpx.Response(200, json={"messages": [{"id": "1", "threadId": "t1"}]})

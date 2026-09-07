@@ -44,6 +44,11 @@ STATE_TTL = 600  # seconds; abandoned OAuth flows are purged after this
 # direct token-cost/usefulness trade-off, see README. Clamped so a bad env value
 # can't silently disable enrichment or blow past Gmail's quota.
 SEARCH_ENRICH_LIMIT = max(0, min(200, int(os.environ.get("SEARCH_ENRICH_LIMIT", "20"))))
+# Total attempts (including the first) per message before giving up on enrichment.
+# Some networks (e.g. self-hosted behind a home NAT/router under the concurrency
+# of a full batch) see more transient failures than a single retry recovers.
+SEARCH_ENRICH_ATTEMPTS = max(1, min(5, int(os.environ.get("SEARCH_ENRICH_ATTEMPTS", "2"))))
+_ENRICH_RETRY_DELAY = 0.3  # seconds between attempts
 
 DEFAULT_REDIRECT_URI = "https://claude.ai/api/mcp/auth_callback"
 
@@ -277,23 +282,25 @@ async def search_emails(query: str, max_results: int = 20) -> list[dict]:
             return None
 
     async def _enrich(msg: dict) -> dict:
-        er = await _fetch_metadata(msg["id"])
-        retried = False
-        if er is None or er.status_code in _RETRYABLE_STATUSES:
-            # Network errors, rate limiting, and server errors are usually transient
-            # (confirmed empirically: most messages that fail here succeed on an
-            # immediate retry) — retry once before degrading. Other 4xx (403/404,
-            # etc.) are permanent and not worth a second call.
-            retried = True
+        # Network errors, rate limiting, and server errors are usually transient —
+        # retry up to SEARCH_ENRICH_ATTEMPTS total tries before degrading. Other 4xx
+        # (403/404, etc.) are permanent and stop retrying immediately.
+        er = None
+        attempt = 0
+        for attempt in range(1, SEARCH_ENRICH_ATTEMPTS + 1):
             er = await _fetch_metadata(msg["id"])
+            if er is not None and er.status_code not in _RETRYABLE_STATUSES:
+                break
+            if attempt < SEARCH_ENRICH_ATTEMPTS:
+                await asyncio.sleep(_ENRICH_RETRY_DELAY)
 
         if er is None:
-            log.warning("search_emails: enrich failed for %s (network error%s)",
-                        msg["id"], ", after retry" if retried else "")
+            log.warning("search_emails: enrich failed for %s (network error, %d attempt%s)",
+                        msg["id"], attempt, "" if attempt == 1 else "s")
             return msg
         if not er.is_success:
-            log.warning("search_emails: enrich failed for %s (HTTP %s%s): %s",
-                        msg["id"], er.status_code, ", after retry" if retried else "",
+            log.warning("search_emails: enrich failed for %s (HTTP %s, %d attempt%s): %s",
+                        msg["id"], er.status_code, attempt, "" if attempt == 1 else "s",
                         er.text[:200])
             return msg
         data = er.json()
