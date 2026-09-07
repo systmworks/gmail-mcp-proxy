@@ -65,6 +65,7 @@ The server acts as an OAuth proxy: it presents itself as an OAuth 2.0 authorizat
 | `LOG_LEVEL` | Optional. Python logging level (`INFO`, `WARNING`, `DEBUG`, etc.). Defaults to `INFO`. |
 | `READ_ONLY_ALIASES` | Optional. Comma-separated list of connector aliases (e.g. `work`) that should be restricted to read-only access — no send, draft, label changes, or trash. See below. |
 | `SEARCH_ENRICH_LIMIT` | Optional. How many `search_emails` results (0–200) get enriched with from/to/subject/date/snippet/labels instead of bare id/threadId. Defaults to `20`. Trades tokens for fewer round-trips: each enriched result costs a few hundred tokens, which pays off when scanning many results at once but is wasted on results never looked at. `read_message` is unaffected either way — it always returns a message's full decoded text body (not attachments), so it's the more expensive call per-message, just not per-search. |
+| `SEARCH_ENRICH_ATTEMPTS` | Optional. Total attempts (1–5) per message before giving up on enrichment and falling back to bare id/threadId. Defaults to `2`. Raise this if you're seeing a lot of bare results in `search_emails` output — self-hosted networks under the concurrency of a full batch tend to see more transient failures than a Railway/PaaS deployment. |
 
 **`search_emails` result fields**
 
