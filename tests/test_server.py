@@ -195,3 +195,54 @@ async def test_write_tools_reject_read_only_sessions():
     server._read_only.set(True)
     with pytest.raises(PermissionError):
         await server.delete_draft("abc")
+
+
+@respx.mock
+async def test_modify_labels_retries_and_recovers_from_transient_5xx():
+    # Regression coverage for API_RETRY_ATTEMPTS: bulk label operations otherwise
+    # fail outright the moment Gmail rate-limits a single call.
+    route = respx.post(f"{server.GMAIL}/messages/msg1/modify").mock(side_effect=[
+        httpx.Response(503),
+        httpx.Response(200, json={"id": "msg1", "labelIds": ["INBOX", "IMPORTANT"]}),
+    ])
+
+    result = await server.modify_labels("msg1", add=["IMPORTANT"])
+
+    assert route.call_count == 2
+    assert result == {"id": "msg1", "labelIds": ["INBOX", "IMPORTANT"]}
+
+
+@respx.mock
+async def test_modify_labels_raises_after_exhausting_retries_on_persistent_failure():
+    route = respx.post(f"{server.GMAIL}/messages/msg1/modify").mock(
+        return_value=httpx.Response(503)
+    )
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await server.modify_labels("msg1", add=["IMPORTANT"])
+
+    assert route.call_count == server.API_RETRY_ATTEMPTS
+
+
+@respx.mock
+async def test_modify_labels_does_not_retry_permanent_4xx():
+    route = respx.post(f"{server.GMAIL}/messages/msg1/modify").mock(
+        return_value=httpx.Response(404)
+    )
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await server.modify_labels("msg1", add=["IMPORTANT"])
+
+    assert route.call_count == 1
+
+
+@respx.mock
+async def test_modify_labels_retries_on_network_error_then_raises():
+    route = respx.post(f"{server.GMAIL}/messages/msg1/modify").mock(
+        side_effect=httpx.ConnectTimeout("boom")
+    )
+
+    with pytest.raises(httpx.ConnectTimeout):
+        await server.modify_labels("msg1", add=["IMPORTANT"])
+
+    assert route.call_count == server.API_RETRY_ATTEMPTS

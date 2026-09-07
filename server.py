@@ -15,6 +15,7 @@ import secrets
 import time
 from contextvars import ContextVar
 from email.mime.text import MIMEText
+from typing import Any
 from urllib.parse import urlencode, urlparse
 
 import httpx
@@ -91,9 +92,15 @@ def _google_scopes(read_only: bool) -> str:
 GMAIL = "https://gmail.googleapis.com/gmail/v1/users/me"
 GCAL = "https://www.googleapis.com/calendar/v3"
 
-# search_emails' per-message enrichment retries once on these — rate limiting and
-# server errors are usually transient. Other 4xx (403/404, etc.) are permanent.
+# Outbound Gmail/Calendar API calls retry on these — rate limiting and server
+# errors are usually transient. Other 4xx (403/404, etc.) are permanent.
 _RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
+
+# Total attempts (including the first) for a write-tool API call before giving up.
+# A bulk operation (e.g. labelling hundreds of messages) otherwise fails outright
+# the moment Gmail rate-limits a single call, with no chance to recover.
+API_RETRY_ATTEMPTS = max(1, min(5, int(os.environ.get("API_RETRY_ATTEMPTS", "2"))))
+_API_RETRY_DELAY = 0.3  # seconds between attempts
 
 # Shared connection-pooled client for all outbound Gmail/Calendar/Google OAuth requests.
 # Created/closed around the ASGI lifespan in _App.__call__ — avoids paying a fresh
@@ -202,6 +209,31 @@ def _auth() -> dict:
     if not t:
         raise RuntimeError("not authenticated")
     return {"Authorization": f"Bearer {t}"}
+
+
+async def _request_with_retry(method: str, url: str, **kwargs: Any) -> httpx.Response:
+    """Write-tool API call with retry — up to API_RETRY_ATTEMPTS total tries on
+    network errors or retryable statuses (429, 5xx) before giving up. Callers keep
+    calling r.raise_for_status() as before: a final retryable-status response is
+    returned as-is (so that still raises), a final network error is re-raised."""
+    c = _client()
+    last_exc: httpx.HTTPError | None = None
+    r: httpx.Response | None = None
+    for attempt in range(1, API_RETRY_ATTEMPTS + 1):
+        try:
+            r = await c.request(method, url, **kwargs)
+            last_exc = None
+        except httpx.HTTPError as e:
+            last_exc = e
+            r = None
+        if r is not None and r.status_code not in _RETRYABLE_STATUSES:
+            return r
+        if attempt < API_RETRY_ATTEMPTS:
+            await asyncio.sleep(_API_RETRY_DELAY)
+    if last_exc is not None:
+        raise last_exc
+    assert r is not None
+    return r
 
 
 def _require_write() -> None:
@@ -396,8 +428,7 @@ async def send_email(to: str, subject: str, body: str, cc: str = "",
     payload: dict = {"raw": _build_email(to, subject, body, cc, in_reply_to, references)}
     if thread_id:
         payload["threadId"] = thread_id
-    c = _client()
-    r = await c.post(f"{GMAIL}/messages/send", headers=_auth(), json=payload)
+    r = await _request_with_retry("POST", f"{GMAIL}/messages/send", headers=_auth(), json=payload)
     r.raise_for_status()
     return r.json()
 
@@ -406,9 +437,8 @@ async def send_email(to: str, subject: str, body: str, cc: str = "",
 async def create_draft(to: str, subject: str, body: str, cc: str = "") -> dict:
     """Create a Gmail draft."""
     _require_write()
-    c = _client()
-    r = await c.post(f"{GMAIL}/drafts", headers=_auth(),
-                     json={"message": {"raw": _build_email(to, subject, body, cc)}})
+    r = await _request_with_retry("POST", f"{GMAIL}/drafts", headers=_auth(),
+                                  json={"message": {"raw": _build_email(to, subject, body, cc)}})
     r.raise_for_status()
     return r.json()
 
@@ -427,9 +457,8 @@ async def list_drafts(max_results: int = 10) -> list[dict]:
 async def send_draft(draft_id: str) -> dict:
     """Send an existing Gmail draft."""
     _require_write()
-    c = _client()
-    r = await c.post(f"{GMAIL}/drafts/send", headers=_auth(),
-                     json={"id": draft_id})
+    r = await _request_with_retry("POST", f"{GMAIL}/drafts/send", headers=_auth(),
+                                  json={"id": draft_id})
     r.raise_for_status()
     return r.json()
 
@@ -439,9 +468,8 @@ async def update_draft(draft_id: str, to: str, subject: str, body: str,
                        cc: str = "") -> dict:
     """Replace the content of an existing Gmail draft."""
     _require_write()
-    c = _client()
-    r = await c.put(f"{GMAIL}/drafts/{draft_id}", headers=_auth(),
-                    json={"message": {"raw": _build_email(to, subject, body, cc)}})
+    r = await _request_with_retry("PUT", f"{GMAIL}/drafts/{draft_id}", headers=_auth(),
+                                  json={"message": {"raw": _build_email(to, subject, body, cc)}})
     r.raise_for_status()
     return r.json()
 
@@ -450,8 +478,7 @@ async def update_draft(draft_id: str, to: str, subject: str, body: str,
 async def delete_draft(draft_id: str) -> dict:
     """Permanently delete a Gmail draft."""
     _require_write()
-    c = _client()
-    r = await c.delete(f"{GMAIL}/drafts/{draft_id}", headers=_auth())
+    r = await _request_with_retry("DELETE", f"{GMAIL}/drafts/{draft_id}", headers=_auth())
     if r.status_code != 204:
         r.raise_for_status()
     return {"deleted": draft_id}
@@ -471,11 +498,10 @@ async def create_label(name: str, label_list_visibility: str = "labelShow",
                        message_list_visibility: str = "show") -> dict:
     """Create a new Gmail label."""
     _require_write()
-    c = _client()
-    r = await c.post(f"{GMAIL}/labels", headers=_auth(),
-                     json={"name": name,
-                           "labelListVisibility": label_list_visibility,
-                           "messageListVisibility": message_list_visibility})
+    r = await _request_with_retry("POST", f"{GMAIL}/labels", headers=_auth(),
+                                  json={"name": name,
+                                        "labelListVisibility": label_list_visibility,
+                                        "messageListVisibility": message_list_visibility})
     r.raise_for_status()
     return r.json()
 
@@ -493,8 +519,7 @@ async def update_label(label_id: str, name: str | None = None,
         body["labelListVisibility"] = label_list_visibility
     if message_list_visibility is not None:
         body["messageListVisibility"] = message_list_visibility
-    c = _client()
-    r = await c.patch(f"{GMAIL}/labels/{label_id}", headers=_auth(), json=body)
+    r = await _request_with_retry("PATCH", f"{GMAIL}/labels/{label_id}", headers=_auth(), json=body)
     r.raise_for_status()
     return r.json()
 
@@ -503,8 +528,7 @@ async def update_label(label_id: str, name: str | None = None,
 async def delete_label(label_id: str) -> dict:
     """Permanently delete a Gmail label."""
     _require_write()
-    c = _client()
-    r = await c.delete(f"{GMAIL}/labels/{label_id}", headers=_auth())
+    r = await _request_with_retry("DELETE", f"{GMAIL}/labels/{label_id}", headers=_auth())
     if r.status_code != 204:
         r.raise_for_status()
     return {"deleted": label_id}
@@ -515,9 +539,8 @@ async def modify_labels(message_id: str, add: list[str] | None = None,
                         remove: list[str] | None = None) -> dict:
     """Add or remove labels on a Gmail message."""
     _require_write()
-    c = _client()
-    r = await c.post(f"{GMAIL}/messages/{message_id}/modify", headers=_auth(),
-                     json={"addLabelIds": add or [], "removeLabelIds": remove or []})
+    r = await _request_with_retry("POST", f"{GMAIL}/messages/{message_id}/modify", headers=_auth(),
+                                  json={"addLabelIds": add or [], "removeLabelIds": remove or []})
     r.raise_for_status()
     return r.json()
 
@@ -526,9 +549,8 @@ async def modify_labels(message_id: str, add: list[str] | None = None,
 async def report_phishing(message_id: str) -> dict:
     """Mark a Gmail message as spam."""
     _require_write()
-    c = _client()
-    r = await c.post(f"{GMAIL}/messages/{message_id}/modify", headers=_auth(),
-                     json={"addLabelIds": ["SPAM"], "removeLabelIds": ["INBOX"]})
+    r = await _request_with_retry("POST", f"{GMAIL}/messages/{message_id}/modify", headers=_auth(),
+                                  json={"addLabelIds": ["SPAM"], "removeLabelIds": ["INBOX"]})
     r.raise_for_status()
     return r.json()
 
@@ -537,8 +559,7 @@ async def report_phishing(message_id: str) -> dict:
 async def trash_message(message_id: str) -> dict:
     """Move a Gmail message to trash."""
     _require_write()
-    c = _client()
-    r = await c.post(f"{GMAIL}/messages/{message_id}/trash", headers=_auth())
+    r = await _request_with_retry("POST", f"{GMAIL}/messages/{message_id}/trash", headers=_auth())
     r.raise_for_status()
     return r.json()
 

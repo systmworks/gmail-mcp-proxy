@@ -15,6 +15,20 @@ only appears when the date changes from the entry above it.
 
 ## 2026-09-08
 
+### 0.27 — Retry write-tool calls on transient Gmail failures
+
+No write tool (`send_email`, `modify_labels`, `create_label`, etc.) retried on
+failure — a single Gmail rate-limit or 5xx during a bulk operation (e.g.
+labelling hundreds of messages) failed that call outright with no recovery.
+
+**Added**
+- `_request_with_retry` helper: retries a write-tool API call up to
+  `API_RETRY_ATTEMPTS` total tries (env var, default `2`) on network errors or
+  retryable statuses (429, 5xx), with a short delay between attempts. Permanent
+  4xx still fails on the first try. All 11 write tools now use it.
+- `tests/test_server.py`: coverage for recovery on retry, exhausting retries on
+  persistent failure, not retrying permanent 4xx, and retrying network errors.
+
 ### 0.26 — Configurable search_emails enrichment retry count
 
 Self-hosted deployment saw ~50% of a 20-message enrichment batch fail even
