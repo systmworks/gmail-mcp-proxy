@@ -165,6 +165,8 @@ async def _refresh(jti: str) -> str:
             "grant_type": "refresh_token",
         })
         t = r.json()
+        log.info("session %s: refresh response has_access_token=%s expires_in=%s",
+                 jti, "access_token" in t, t.get("expires_in"))
         if "access_token" not in t:
             _token_store.pop(jti, None)
             _refresh_locks.pop(jti, None)
@@ -173,6 +175,8 @@ async def _refresh(jti: str) -> str:
             raise ReauthRequired(reason)
         d["access_token"] = t["access_token"]
         d["expiry"] = time.time() + t.get("expires_in", 3600)
+        log.info("session %s: refreshed, new expiry in %.0fs (now=%.0f, expiry=%.0f)",
+                 jti, d["expiry"] - time.time(), time.time(), d["expiry"])
         return d["access_token"]
 
 
@@ -180,7 +184,10 @@ async def _google_access_token(jti: str) -> str:
     d = _token_store.get(jti)
     if not d:
         raise ReauthRequired("session not found")
-    if time.time() >= d["expiry"] - 60:
+    remaining = d["expiry"] - time.time()
+    if remaining <= 60:
+        log.info("session %s: access token needs refresh (remaining=%.0fs, expiry=%.0f, now=%.0f)",
+                 jti, remaining, d["expiry"], time.time())
         return await _refresh(jti)
     return d["access_token"]
 
@@ -675,9 +682,11 @@ async def _auth_callback(req: Request):
         return Response("Failed to fetch Google account info", status_code=502)
     userinfo = ui.json()
 
-    log.info("new session authenticated: %s (read_only=%s)",
-             userinfo.get("email"), state_data.get("read_only", False))
     jti = secrets.token_urlsafe(16)
+    log.info("new session authenticated: %s (read_only=%s) jti=%s has_refresh_token=%s "
+             "expires_in=%s",
+             userinfo.get("email"), state_data.get("read_only", False), jti,
+             tokens.get("refresh_token") is not None, tokens.get("expires_in"))
     _token_store[jti] = {
         "access_token": tokens["access_token"],
         "refresh_token": tokens.get("refresh_token"),

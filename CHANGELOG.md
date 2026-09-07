@@ -13,6 +13,23 @@ Releases (no external consumers to serve release notes to), but working mileston
 get a lightweight git tag (`v0.1`, `v0.2`, …) as a rollback anchor. A date heading
 only appears when the date changes from the entry above it.
 
+## 2026-09-07
+
+### 0.25 — Log token expiry/refresh decisions
+
+Self-hosted deployment (moved off Railway) reported access tokens timing out
+after ~1hr with no matching `ReauthRequired`/`invalid_grant` in logs — nothing
+existing told us whether `_refresh` was even being called, or what Google
+actually returned when it was.
+
+**Added**
+- `_auth_callback` logs `has_refresh_token`/`expires_in` from the initial
+  token exchange.
+- `_google_access_token` logs the remaining seconds whenever it decides a
+  refresh is needed.
+- `_refresh` logs Google's raw `expires_in` on each refresh response, and the
+  new expiry once stored.
+
 ## 2026-08-14
 
 ### 0.24 — Retry transient search_emails enrichment failures, log persistent ones
