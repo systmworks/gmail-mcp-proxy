@@ -1,4 +1,5 @@
 import base64
+import time
 
 import httpx
 import pytest
@@ -14,11 +15,20 @@ def _b64(text: str) -> str:
 @pytest.fixture(autouse=True)
 async def http_client():
     server._http_client = httpx.AsyncClient(timeout=5)
-    server._google_token.set("fake-token")
+    server._session_jti.set("fake-jti")
+    server._token_store["fake-jti"] = {
+        "access_token": "fake-token",
+        "refresh_token": "fake-refresh",
+        "expiry": time.time() + 3600,
+        "email": "test@example.com",
+        "read_only": False,
+        "jwt_exp": time.time() + 86400,
+    }
     server._read_only.set(False)
     yield
     await server._http_client.aclose()
     server._http_client = None
+    server._token_store.pop("fake-jti", None)
 
 
 @respx.mock

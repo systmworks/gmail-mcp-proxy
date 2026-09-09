@@ -13,6 +13,25 @@ Releases (no external consumers to serve release notes to), but working mileston
 get a lightweight git tag (`v0.1`, `v0.2`, …) as a rollback anchor. A date heading
 only appears when the date changes from the entry above it.
 
+## 2026-09-09
+
+### 0.28 — Fix stale Google token used right after a successful refresh
+
+Self-hosted deployment (not seen on Railway) showed `get_profile` and other tool
+calls 401 immediately after a logged-successful token refresh — `_token_store` had
+the fresh token, but the per-request Google token was resolved once in the outer
+ASGI auth check and cached into a `ContextVar`. If FastMCP executed the actual tool
+call in a different asyncio Task than the one that ran that auth check, that task
+never saw the later `.set()` and kept using whatever token was current when its own
+context was created.
+
+**Fixed**
+- `_auth()` is now `async` and resolves the token from `_token_store` at the moment
+  of use (`_google_access_token(jti)`) instead of trusting a value handed to it
+  earlier. The ContextVar (renamed `_session_jti`, was `_google_token`) now carries
+  only the session's `jti` — invariant for the session's lifetime — not the token
+  itself. All 22 `headers=_auth()` call sites updated to `await _auth()`.
+
 ## 2026-09-08
 
 ### 0.27 — Retry write-tool calls on transient Gmail failures

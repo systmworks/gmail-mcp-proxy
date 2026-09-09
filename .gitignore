@@ -4,3 +4,5 @@ credentials/
 __pycache__/
 .pytest_cache/
 .venv*/
+TREASURER_MAILBOX_LABEL_RULES.md
+SESSION_HANDOVER.md
