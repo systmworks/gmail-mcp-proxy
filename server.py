@@ -116,9 +116,19 @@ GCAL = "https://www.googleapis.com/calendar/v3"
 # errors are usually transient. Other 4xx (403/404, etc.) are permanent.
 _RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
 
-# Total attempts (including the first) for a write-tool API call before giving up.
-# A bulk operation (e.g. labelling hundreds of messages) otherwise fails outright
-# the moment Gmail rate-limits a single call, with no chance to recover.
+# HTTP methods safe to retry even on a network-level error (timeout, connection
+# reset) rather than just a definite HTTP status. GET/HEAD are defined by HTTP
+# itself as safe/idempotent — retrying one can't duplicate an effect. POST/PUT/
+# PATCH/DELETE are not: whether the original request already landed server-side
+# before a network error is ambiguous, so retrying one of those risks silently
+# duplicating it (e.g. sending the same email twice). See _request_with_retry.
+_IDEMPOTENT_METHODS = frozenset({"GET", "HEAD"})
+
+# Total attempts (including the first) for an outbound API call before giving up.
+# A bulk write operation (e.g. labelling hundreds of messages) otherwise fails
+# outright the moment Gmail rate-limits a single call, with no chance to recover;
+# a read hitting a transient 429/503 (or, for GET/HEAD, a network error) gets the
+# same benefit.
 API_RETRY_ATTEMPTS = max(1, min(5, int(os.environ.get("API_RETRY_ATTEMPTS", "2"))))
 _API_RETRY_DELAY = 0.3  # seconds between attempts
 
@@ -262,14 +272,24 @@ async def _request_with_retry(method: str, url: str, **kwargs: Any) -> httpx.Res
     r.raise_for_status() as before: a final retryable-status response is returned
     as-is (so that still raises).
 
-    Network-level errors (timeouts, connection resets) are NOT retried — they
-    propagate immediately. Whether the request already landed server-side before
-    the error is ambiguous, and blindly retrying a non-idempotent write
-    (send_email, create_draft, etc.) risks silently duplicating it."""
+    Network-level errors (timeouts, connection resets) are only retried for
+    GET/HEAD (_IDEMPOTENT_METHODS) — methods HTTP itself defines as safe to repeat.
+    For everything else (POST/PUT/PATCH/DELETE), whether the original request
+    already landed server-side before the network error is ambiguous, so a network
+    error propagates immediately instead: blindly retrying a non-idempotent write
+    (send_email, create_draft, etc.) risks silently duplicating it. This falls out
+    of `method`, already required at every call site — no extra parameter for
+    callers to get backwards."""
     c = _client()
     r: httpx.Response | None = None
     for attempt in range(1, API_RETRY_ATTEMPTS + 1):
-        r = await c.request(method, url, **kwargs)
+        try:
+            r = await c.request(method, url, **kwargs)
+        except httpx.HTTPError:
+            if method not in _IDEMPOTENT_METHODS or attempt == API_RETRY_ATTEMPTS:
+                raise
+            await asyncio.sleep(_API_RETRY_DELAY)
+            continue
         if r.status_code not in _RETRYABLE_STATUSES:
             return r
         if attempt < API_RETRY_ATTEMPTS:
@@ -285,10 +305,13 @@ def _require_write() -> None:
 
 def _effective_read_only(payload: dict, alias: str) -> bool:
     """A restricted alias stays restricted even if the JWT itself says
-    read_only=False — e.g. because the OAuth client never echoed back the
-    'resource' parameter that read_only was originally decided from. `alias`
-    here comes from server-side path routing (_split_alias), not anything the
-    client asserts, so this can't be bypassed by client behavior."""
+    read_only=False — e.g. because READ_ONLY_ALIASES was edited to add this alias
+    *after* the JWT was already minted. JWTs are immutable for their 30-day life, so
+    without this re-check, a config change would only take effect for brand-new
+    logins — existing sessions would keep read/write access until their token
+    happened to expire. `alias` here comes from server-side path routing
+    (_split_alias) on the *current* request, not anything the client asserts, so
+    this can't be bypassed by client behavior either."""
     return payload.get("read_only", False) or alias in READ_ONLY_ALIASES
 
 
@@ -306,34 +329,46 @@ def _build_email(to: str, subject: str, body: str, cc: str = "",
     return base64.urlsafe_b64encode(msg.as_bytes()).decode()
 
 
-def _find_attachments(part: dict, found: list[dict]) -> None:
-    """Recursively collect attachment metadata (filename/mimeType/size/partId) from
-    a message's MIME part tree. Kept separate from _find_bodies (which only cares
-    about text/plain and text/html).
+def _find_bodies_and_attachments(part: dict, bodies: dict[str, str],
+                                 attachments: list[dict]) -> None:
+    """Single recursive pass over a message's MIME part tree collecting both decoded
+    text bodies (text/plain and text/html) and attachment metadata (filename/
+    mimeType/size/partId) — one walk instead of two separate ones over the same
+    tree. Unlike a body-only walker, this can't early-exit once both body types are
+    found: attachments can appear anywhere in the tree and all of them must be
+    collected regardless.
 
-    Deliberately surfaces partId, not attachmentId: Gmail's attachmentId is only
-    valid transiently and has been observed to differ across separate messages.get
-    calls for the very same message/attachment, so it can't be handed out here for
-    a later get_attachment call to reuse. partId is documented as immutable, so
-    get_attachment takes that instead and re-resolves a fresh attachmentId from it
-    within its own single request.
+    Deliberately surfaces partId, not attachmentId, for attachments: Gmail's
+    attachmentId is only valid transiently and has been observed to differ across
+    separate messages.get calls for the very same message/attachment, so it can't be
+    handed out here for a later get_attachment call to reuse. partId is documented
+    as immutable, so get_attachment takes that instead and re-resolves a fresh
+    attachmentId from it within its own single request.
     """
+    mime = part.get("mimeType")
+    if mime in ("text/plain", "text/html") and mime not in bodies:
+        raw = part.get("body", {}).get("data", "")
+        if raw:
+            bodies[mime] = base64.urlsafe_b64decode(raw + "==").decode("utf-8", errors="replace")
+
     filename = part.get("filename")
     attachment_id = part.get("body", {}).get("attachmentId")
     if filename and attachment_id:
-        found.append({
+        attachments.append({
             "partId": part.get("partId", ""),
             "filename": filename,
             "mimeType": part.get("mimeType", ""),
             "size": part.get("body", {}).get("size", 0),
         })
+
     for sub in part.get("parts", []):
-        _find_attachments(sub, found)
+        _find_bodies_and_attachments(sub, bodies, attachments)
 
 
 def _find_part_by_id(part: dict, part_id: str) -> dict | None:
     """Locate a MIME part by its partId, for get_attachment to re-resolve a fresh
-    attachmentId from within a single request (see _find_attachments docstring)."""
+    attachmentId from within a single request (see _find_bodies_and_attachments'
+    docstring for why attachmentId itself can't be reused across calls)."""
     if part.get("partId") == part_id:
         return part
     for sub in part.get("parts", []):
@@ -351,7 +386,10 @@ mcp = FastMCP("Gmail MCP")
 async def _call(method: str, url: str, **kwargs: Any) -> httpx.Response:
     """Shared auth + retry + raise-for-status boilerplate for every Gmail/Calendar
     API call, read or write alike — both go through the same _request_with_retry
-    (see its own docstring for exactly what it does and doesn't retry)."""
+    (see its own docstring for exactly what it does and doesn't retry). Always
+    injects the auth header itself — callers must not pass their own `headers`
+    kwarg (Google's OAuth endpoints build their own headers directly and don't go
+    through this helper, since they're not authenticated the same way)."""
     r = await _request_with_retry(method, url, headers=await _auth(), **kwargs)
     r.raise_for_status()
     return r
@@ -361,7 +399,7 @@ async def _call_json(method: str, url: str, **kwargs: Any) -> dict:
     return (await _call(method, url, **kwargs)).json()
 
 
-async def _call_list(method: str, url: str, key: str, **kwargs: Any) -> list[dict]:
+async def _call_list(method: str, url: str, *, key: str, **kwargs: Any) -> list[dict]:
     return (await _call(method, url, **kwargs)).json().get(key, [])
 
 
@@ -449,27 +487,11 @@ async def read_message(message_id: str) -> dict:
     an attachment's bytes."""
     data = await _call_json("GET", f"{GMAIL}/messages/{_enc(message_id)}", params={"format": "full"})
 
-    def _find_bodies(part: dict, found: dict) -> None:
-        # Single recursive pass collecting both text/plain and text/html (e.g.
-        # multipart/mixed > multipart/alternative > text/plain), preferring
-        # plain over html once done rather than walking the tree twice.
-        mime = part.get("mimeType")
-        if mime in ("text/plain", "text/html") and mime not in found:
-            raw = part.get("body", {}).get("data", "")
-            if raw:
-                found[mime] = base64.urlsafe_b64decode(raw + "==").decode("utf-8", errors="replace")
-        for sub in part.get("parts", []):
-            if "text/plain" in found and "text/html" in found:
-                return
-            _find_bodies(sub, found)
-
     payload = data.get("payload", {})
     bodies: dict[str, str] = {}
-    _find_bodies(payload, bodies)
-    body = bodies.get("text/plain") or bodies.get("text/html", "")
-
     attachments: list[dict] = []
-    _find_attachments(payload, attachments)
+    _find_bodies_and_attachments(payload, bodies, attachments)
+    body = bodies.get("text/plain") or bodies.get("text/html", "")
 
     hdrs = {h["name"]: h["value"] for h in payload.get("headers", [])}
     return {
@@ -575,7 +597,7 @@ async def create_draft(to: str, subject: str, body: str, cc: str = "") -> dict:
 @mcp.tool
 async def list_drafts(max_results: int = 10) -> list[dict]:
     """List Gmail drafts."""
-    return await _call_list("GET", f"{GMAIL}/drafts", "drafts", params={"maxResults": max_results})
+    return await _call_list("GET", f"{GMAIL}/drafts", key="drafts", params={"maxResults": max_results})
 
 
 @mcp.tool
@@ -604,7 +626,7 @@ async def delete_draft(draft_id: str) -> dict:
 @mcp.tool
 async def list_labels() -> list[dict]:
     """List all Gmail labels."""
-    return await _call_list("GET", f"{GMAIL}/labels", "labels")
+    return await _call_list("GET", f"{GMAIL}/labels", key="labels")
 
 
 @mcp.tool
@@ -668,7 +690,7 @@ async def trash_message(message_id: str) -> dict:
 @mcp.tool
 async def list_calendars() -> list[dict]:
     """List all Google Calendars."""
-    return await _call_list("GET", f"{GCAL}/users/me/calendarList", "items")
+    return await _call_list("GET", f"{GCAL}/users/me/calendarList", key="items")
 
 
 @mcp.tool
@@ -680,14 +702,14 @@ async def list_events(calendar_id: str = "primary", time_min: str = "",
         params["timeMin"] = time_min
     if time_max:
         params["timeMax"] = time_max
-    return await _call_list("GET", f"{GCAL}/calendars/{_enc(calendar_id)}/events", "items", params=params)
+    return await _call_list("GET", f"{GCAL}/calendars/{_enc(calendar_id)}/events", key="items", params=params)
 
 
 @mcp.tool
 async def search_events(query: str, calendar_id: str = "primary",
                         max_results: int = 10) -> list[dict]:
     """Search calendar events by keyword."""
-    return await _call_list("GET", f"{GCAL}/calendars/{_enc(calendar_id)}/events", "items",
+    return await _call_list("GET", f"{GCAL}/calendars/{_enc(calendar_id)}/events", key="items",
                             params={"q": query, "maxResults": max_results, "singleEvents": True})
 
 

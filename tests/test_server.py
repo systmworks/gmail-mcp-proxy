@@ -205,6 +205,9 @@ async def test_read_message_includes_attachment_metadata():
 
     result = await server.read_message("123")
 
+    # Both extracted from the same single tree walk (_find_bodies_and_attachments) —
+    # confirms merging what used to be two separate passes didn't drop either.
+    assert result["body"] == "body text"
     assert result["attachments"] == [
         {"partId": "1", "filename": "invoice.pdf", "mimeType": "application/pdf", "size": 4096},
     ]
@@ -578,3 +581,35 @@ async def test_modify_labels_does_not_retry_network_error():
         await server.modify_labels("msg1", add=["IMPORTANT"])
 
     assert route.call_count == 1
+
+
+@respx.mock
+async def test_read_message_retries_network_error_and_recovers():
+    # GET/HEAD are safe to retry even on a network-level error (unlike the write
+    # case above) — retrying can't duplicate an effect. _request_with_retry derives
+    # this from the HTTP method itself (_IDEMPOTENT_METHODS), so no call site needs
+    # to opt in explicitly.
+    route = respx.get(f"{server.GMAIL}/messages/123").mock(side_effect=[
+        httpx.ConnectTimeout("boom"),
+        httpx.Response(200, json={
+            "id": "123", "threadId": "t123", "snippet": "hi", "labelIds": [],
+            "payload": {"headers": [], "mimeType": "text/plain", "body": {"data": _b64("hi")}},
+        }),
+    ])
+
+    result = await server.read_message("123")
+
+    assert route.call_count == 2
+    assert result["body"] == "hi"
+
+
+@respx.mock
+async def test_read_message_raises_after_exhausting_network_error_retries():
+    route = respx.get(f"{server.GMAIL}/messages/123").mock(
+        side_effect=httpx.ConnectTimeout("boom")
+    )
+
+    with pytest.raises(httpx.ConnectTimeout):
+        await server.read_message("123")
+
+    assert route.call_count == server.API_RETRY_ATTEMPTS

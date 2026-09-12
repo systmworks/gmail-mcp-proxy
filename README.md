@@ -93,18 +93,19 @@ second layer.
 
 **Enforcement is server-side and unconditional** — which alias a request comes in
 through is derived from the URL path on every single request, not something the
-client asserts, so a restricted alias stays restricted even if the OAuth client
-never echoes back the `resource` parameter during authorization. That parameter
-still affects which Google scopes get requested up front (best-effort
-minimization — a restricted account ideally never even gets asked to grant write
-scopes), so it's still worth confirming it worked:
+client asserts. This is what decides *both* which Google scopes get requested at
+authorization time (a restricted alias only ever requests
+`gmail.readonly`/`calendar.readonly` — scope minimization is guaranteed, not
+best-effort) *and* whether write tool calls are refused afterward — neither can be
+bypassed by a misbehaving or malicious OAuth client, including one that never sends
+the `resource` parameter at all. Still worth confirming it actually took effect for
+your connector:
 
 1. Check the server logs right after connecting — look for a line like
-   `authorize: alias='work' resource='...' -> read-only`. If `alias` comes back
-   empty, Google still asked for full read/write scopes for that grant (the OAuth
-   client didn't send `resource`) — the tool-level restriction still applies
-   regardless, but reconnect and check again if you want the scope-minimization
-   layer working too.
+   `authorize: alias='work' resource='...' -> read-only`. `resource` here is purely
+   informational (whatever the OAuth client happened to send); `alias` is what
+   actually decided the outcome, and it always reflects the URL you connected
+   through (e.g. `/work/mcp`).
 2. Ask Claude, through that connector, to send a test email or trash a message. It
    should be refused.
 

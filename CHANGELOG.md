@@ -10,10 +10,59 @@ history only, not here. Version numbers are permanent once assigned — removing
 out-of-scope entry leaves a gap rather than renumbering everything after it, so a
 missing number means an administrative-only change, not a lost entry. No GitHub
 Releases (no external consumers to serve release notes to), but working milestones
-get a lightweight git tag (`v0.1`, `v0.2`, …) as a rollback anchor. A date heading
+get an annotated git tag (`v0.1`, `v0.2`, …) as a rollback anchor. A date heading
 only appears when the date changes from the entry above it.
 
 ## 2026-09-13
+
+### 0.40 — Retry network errors for idempotent (GET/HEAD) calls too
+
+Flagged by the same independent review as 0.39: 0.32 correctly stopped retrying
+network-level errors for non-idempotent writes (ambiguous whether the original
+request already landed server-side), but then routed *reads* through that same
+hardened helper — losing network-error retry for GET calls too, even though
+retrying one can't duplicate an effect. Left as an explicit trade-off at the time;
+reconsidered here since this project has hardened against exactly this kind of
+self-hosted network flakiness three times before (0.24-0.26).
+
+**Fixed**
+- `_request_with_retry` now retries a network-level error (not just a definite
+  429/5xx status) when the HTTP method is GET or HEAD (`_IDEMPOTENT_METHODS`) —
+  derived from `method`, which every call site already passes, so no call site
+  needed to change and nothing can pass the wrong flag. POST/PUT/PATCH/DELETE keep
+  propagating a network error immediately, unchanged from 0.32.
+- `tests/test_server.py`: coverage for a read recovering from a network error, and
+  for one still raising once retries are exhausted.
+
+### 0.39 — Cleanup: merge MIME tree walks, fix a stale docstring
+
+An independent, from-scratch code quality pass (not tied to the ported-findings
+review in 0.31-0.38) found a few small things worth fixing.
+
+**Fixed**
+- `_effective_read_only`'s docstring explained itself as guarding against "the
+  OAuth client never echoed back the `resource` parameter" — that was the exact
+  root cause 0.31 fixed. Its real remaining purpose is different: `READ_ONLY_ALIASES`
+  can be edited *after* a 30-day JWT was already minted, and JWTs are immutable for
+  their whole life — without this per-request re-check, a config change would only
+  affect brand-new logins instead of taking effect immediately for existing
+  sessions too. Docstring now describes that.
+
+**Changed**
+- `read_message` walked the MIME part tree twice — once via a nested `_find_bodies`
+  closure for text bodies, once via module-level `_find_attachments` for attachment
+  metadata — the same "walks the tree twice" shape this project already fixed once
+  before (0.13, for the old `_extract_body`). Merged into one module-level
+  `_find_bodies_and_attachments` pass; `get_attachment`'s separate `_find_part_by_id`
+  (locating one specific part, a different job) is untouched.
+- `_call_list`'s `key` parameter is now keyword-only (`key="drafts"` instead of a
+  bare positional string) so call sites read unambiguously.
+- `_call`'s docstring now notes it always injects its own `headers` — a future
+  caller passing its own `headers` kwarg would otherwise hit a confusing
+  multiple-values `TypeError` instead of a clear explanation.
+- `tests/test_server.py`: strengthened `test_read_message_includes_attachment_metadata`
+  to also assert on `body`, confirming the merged walker still extracts both in one
+  pass.
 
 ### 0.38 — Cleanup: safe attachment data access, consolidated request boilerplate
 
