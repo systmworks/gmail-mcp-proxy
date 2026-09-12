@@ -291,20 +291,40 @@ def _build_email(to: str, subject: str, body: str, cc: str = "",
 
 
 def _find_attachments(part: dict, found: list[dict]) -> None:
-    """Recursively collect attachment metadata (filename/mimeType/size/attachmentId)
-    from a message's MIME part tree. Kept separate from _find_bodies (which only
-    cares about text/plain and text/html)."""
+    """Recursively collect attachment metadata (filename/mimeType/size/partId) from
+    a message's MIME part tree. Kept separate from _find_bodies (which only cares
+    about text/plain and text/html).
+
+    Deliberately surfaces partId, not attachmentId: Gmail's attachmentId is only
+    valid transiently and has been observed to differ across separate messages.get
+    calls for the very same message/attachment, so it can't be handed out here for
+    a later get_attachment call to reuse. partId is documented as immutable, so
+    get_attachment takes that instead and re-resolves a fresh attachmentId from it
+    within its own single request.
+    """
     filename = part.get("filename")
     attachment_id = part.get("body", {}).get("attachmentId")
     if filename and attachment_id:
         found.append({
-            "attachmentId": attachment_id,
+            "partId": part.get("partId", ""),
             "filename": filename,
             "mimeType": part.get("mimeType", ""),
             "size": part.get("body", {}).get("size", 0),
         })
     for sub in part.get("parts", []):
         _find_attachments(sub, found)
+
+
+def _find_part_by_id(part: dict, part_id: str) -> dict | None:
+    """Locate a MIME part by its partId, for get_attachment to re-resolve a fresh
+    attachmentId from within a single request (see _find_attachments docstring)."""
+    if part.get("partId") == part_id:
+        return part
+    for sub in part.get("parts", []):
+        found = _find_part_by_id(sub, part_id)
+        if found is not None:
+            return found
+    return None
 
 
 # ── FastMCP tools ──────────────────────────────────────────────────────────────
@@ -386,7 +406,7 @@ async def search_emails(query: str, max_results: int = 20) -> list[dict]:
 @mcp.tool
 async def read_message(message_id: str) -> dict:
     """Read a Gmail message by ID. Returns headers, decoded body, and attachment
-    metadata (filename/attachmentId/mimeType/size) — use get_attachment to download
+    metadata (filename/partId/mimeType/size) — use get_attachment to download
     an attachment's bytes."""
     c = _client()
     r = await c.get(f"{GMAIL}/messages/{message_id}", headers=await _auth(),
@@ -435,8 +455,8 @@ async def read_message(message_id: str) -> dict:
 async def read_thread(thread_id: str) -> dict:
     """Read a full Gmail thread."""
     # Intentionally a raw passthrough (unlike read_message) — each message's raw
-    # payload already contains attachment parts (filename/body.attachmentId/size)
-    # in its MIME tree; get_attachment works from any message's own "id" here.
+    # payload already contains attachment parts (filename/partId/size) in its MIME
+    # tree; get_attachment works from any message's own "id" here.
     c = _client()
     r = await c.get(f"{GMAIL}/threads/{thread_id}", headers=await _auth())
     r.raise_for_status()
@@ -444,24 +464,28 @@ async def read_thread(thread_id: str) -> dict:
 
 
 @mcp.tool
-async def get_attachment(message_id: str, attachment_id: str) -> dict:
+async def get_attachment(message_id: str, part_id: str) -> dict:
     """Download a Gmail attachment's bytes (as standard base64) by message_id and
-    attachment_id from read_message's attachments list. Rejects attachments larger
-    than ATTACHMENT_MAX_MB without downloading them."""
+    partId from read_message's attachments list. Rejects attachments larger than
+    ATTACHMENT_MAX_MB without downloading them."""
     c = _client()
     r = await c.get(f"{GMAIL}/messages/{message_id}", headers=await _auth(),
                     params={"format": "full"})
     r.raise_for_status()
     payload = r.json().get("payload", {})
 
-    found: list[dict] = []
-    _find_attachments(payload, found)
-    meta = next((a for a in found if a["attachmentId"] == attachment_id), None)
-    if meta is None:
-        raise ValueError(f"no attachment {attachment_id!r} found on message {message_id!r}")
-    if meta["size"] > ATTACHMENT_MAX_BYTES:
+    part = _find_part_by_id(payload, part_id)
+    if part is None or not part.get("filename") or not part.get("body", {}).get("attachmentId"):
+        raise ValueError(f"no attachment with partId {part_id!r} found on message {message_id!r}")
+
+    filename = part["filename"]
+    mime_type = part.get("mimeType", "")
+    meta_size = part.get("body", {}).get("size", 0)
+    attachment_id = part["body"]["attachmentId"]
+
+    if meta_size > ATTACHMENT_MAX_BYTES:
         raise ValueError(
-            f"attachment {meta['filename']!r} is {meta['size']} bytes, exceeds "
+            f"attachment {filename!r} is {meta_size} bytes, exceeds "
             f"ATTACHMENT_MAX_MB ({ATTACHMENT_MAX_MB}MB) limit"
         )
 
@@ -471,15 +495,15 @@ async def get_attachment(message_id: str, attachment_id: str) -> dict:
     raw = base64.urlsafe_b64decode(r2.json()["data"] + "==")
     if len(raw) > ATTACHMENT_MAX_BYTES:
         raise ValueError(
-            f"attachment {meta['filename']!r} is {len(raw)} bytes, exceeds "
+            f"attachment {filename!r} is {len(raw)} bytes, exceeds "
             f"ATTACHMENT_MAX_MB ({ATTACHMENT_MAX_MB}MB) limit"
         )
 
     return {
-        "attachmentId": attachment_id,
+        "partId": part_id,
         "messageId": message_id,
-        "filename": meta["filename"],
-        "mimeType": meta["mimeType"],
+        "filename": filename,
+        "mimeType": mime_type,
         "size": len(raw),
         "data": base64.b64encode(raw).decode(),
     }

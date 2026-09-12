@@ -15,6 +15,32 @@ only appears when the date changes from the entry above it.
 
 ## 2026-09-12
 
+### 0.30 — Fix get_attachment: Gmail's attachmentId is not stable across calls
+
+Live testing immediately after deploying 0.29 found `get_attachment` failing with
+"no attachment found" on a real attachment it had just listed via `read_message`.
+Logs showed two separate `messages.get(format=full)` calls for the very same
+message returned two *different* `attachmentId` values for the identical PDF part —
+`get_attachment`'s own internal metadata lookup (a fresh `messages.get` call) never
+matched the `attachmentId` the caller had gotten from an earlier `read_message` call,
+so the design was fundamentally broken for real-world use, not just an edge case.
+
+**Fixed**
+- `read_message`'s `attachments` list now surfaces each part's `partId` instead of
+  `attachmentId` — `partId` is Gmail's documented-immutable structural identifier,
+  unlike `attachmentId` which is apparently only valid within the response that
+  minted it.
+- `get_attachment(message_id, part_id)` (was `attachment_id`) now locates the part by
+  `partId` (`_find_part_by_id`, a new helper) and reads `attachmentId` fresh from
+  that same fetch, immediately before using it to download the bytes — never accepts
+  an `attachmentId` from a separate prior call.
+- `tests/test_server.py`: new regression test
+  (`test_get_attachment_resolves_fresh_attachment_id_each_call`) simulating exactly
+  this scenario — two `messages.get` responses for the same `partId` with different
+  `attachmentId` values — asserting `get_attachment` downloads using the second
+  (fresh) one, not a value cached from the first call. All other attachment tests
+  updated to key off `partId`.
+
 ### 0.29 — Attachment download support
 
 No tool exposed Gmail file attachments — `read_message`'s MIME walker only looked at

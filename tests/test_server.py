@@ -191,8 +191,9 @@ async def test_read_message_includes_attachment_metadata():
             "headers": [],
             "mimeType": "multipart/mixed",
             "parts": [
-                {"mimeType": "text/plain", "body": {"data": _b64("body text")}},
+                {"partId": "0", "mimeType": "text/plain", "body": {"data": _b64("body text")}},
                 {
+                    "partId": "1",
                     "mimeType": "application/pdf",
                     "filename": "invoice.pdf",
                     "body": {"attachmentId": "att1", "size": 4096},
@@ -205,7 +206,7 @@ async def test_read_message_includes_attachment_metadata():
     result = await server.read_message("123")
 
     assert result["attachments"] == [
-        {"attachmentId": "att1", "filename": "invoice.pdf", "mimeType": "application/pdf", "size": 4096},
+        {"partId": "1", "filename": "invoice.pdf", "mimeType": "application/pdf", "size": 4096},
     ]
 
 
@@ -241,6 +242,7 @@ async def test_get_attachment_returns_metadata_and_reencoded_base64():
             "mimeType": "multipart/mixed",
             "parts": [
                 {
+                    "partId": "1",
                     "mimeType": "application/pdf",
                     "filename": "invoice.pdf",
                     "body": {"attachmentId": "att1", "size": len(raw)},
@@ -255,11 +257,56 @@ async def test_get_attachment_returns_metadata_and_reencoded_base64():
         return_value=httpx.Response(200, json={"size": len(raw), "data": urlsafe_data})
     )
 
-    result = await server.get_attachment("123", "att1")
+    result = await server.get_attachment("123", "1")
 
     assert result["filename"] == "invoice.pdf"
     assert result["mimeType"] == "application/pdf"
     assert result["size"] == len(raw)
+    assert base64.b64decode(result["data"]) == raw
+
+
+@respx.mock
+async def test_get_attachment_resolves_fresh_attachment_id_each_call():
+    # Regression test: Gmail's attachmentId has been observed in production to
+    # differ across separate messages.get calls for the very same message/part —
+    # only partId is documented immutable. get_attachment must resolve
+    # attachmentId fresh from its own fetch rather than trusting one a caller
+    # cached from an earlier read_message call.
+    raw = b"pdf bytes"
+
+    def _payload_with_id(attachment_id: str) -> dict:
+        return {
+            "id": "123", "threadId": "t123", "snippet": "hi", "labelIds": [],
+            "payload": {
+                "headers": [],
+                "mimeType": "multipart/mixed",
+                "parts": [{
+                    "partId": "1",
+                    "mimeType": "application/pdf",
+                    "filename": "f.pdf",
+                    "body": {"attachmentId": attachment_id, "size": len(raw)},
+                }],
+            },
+        }
+
+    route = respx.get(f"{server.GMAIL}/messages/123").mock(side_effect=[
+        httpx.Response(200, json=_payload_with_id("stale-id")),
+        httpx.Response(200, json=_payload_with_id("fresh-id")),
+    ])
+    # Simulate a prior read_message call that saw "stale-id" for this part.
+    await server.read_message("123")
+
+    attachment_route = respx.get(f"{server.GMAIL}/messages/123/attachments/fresh-id").mock(
+        return_value=httpx.Response(200, json={
+            "size": len(raw),
+            "data": base64.urlsafe_b64encode(raw).decode().rstrip("="),
+        })
+    )
+
+    result = await server.get_attachment("123", "1")
+
+    assert route.call_count == 2
+    assert attachment_route.called
     assert base64.b64decode(result["data"]) == raw
 
 
@@ -274,6 +321,7 @@ async def test_get_attachment_rejects_oversized_without_downloading():
                 "mimeType": "multipart/mixed",
                 "parts": [
                     {
+                        "partId": "1",
                         "mimeType": "application/pdf",
                         "filename": "big.pdf",
                         "body": {"attachmentId": "att1", "size": 1000},
@@ -288,7 +336,7 @@ async def test_get_attachment_rejects_oversized_without_downloading():
         # to it raises a respx error, proving the bytes were never downloaded.
 
         with pytest.raises(ValueError, match="exceeds"):
-            await server.get_attachment("123", "att1")
+            await server.get_attachment("123", "1")
     finally:
         server.ATTACHMENT_MAX_BYTES = original
 
@@ -301,6 +349,7 @@ async def test_get_attachment_raises_when_id_not_found():
             "mimeType": "multipart/mixed",
             "parts": [
                 {
+                    "partId": "2",
                     "mimeType": "application/pdf",
                     "filename": "invoice.pdf",
                     "body": {"attachmentId": "att-other", "size": 10},
@@ -313,7 +362,7 @@ async def test_get_attachment_raises_when_id_not_found():
     )
 
     with pytest.raises(ValueError, match="no attachment"):
-        await server.get_attachment("123", "att1")
+        await server.get_attachment("123", "1")
 
 
 @respx.mock
@@ -328,6 +377,7 @@ async def test_get_attachment_rejects_oversized_after_download_if_metadata_size_
                 "mimeType": "multipart/mixed",
                 "parts": [
                     {
+                        "partId": "1",
                         "mimeType": "application/pdf",
                         "filename": "mislabeled.pdf",
                         # Metadata size understates the real size (e.g. stale/wrong).
@@ -347,7 +397,7 @@ async def test_get_attachment_rejects_oversized_after_download_if_metadata_size_
         )
 
         with pytest.raises(ValueError, match="exceeds"):
-            await server.get_attachment("123", "att1")
+            await server.get_attachment("123", "1")
     finally:
         server.ATTACHMENT_MAX_BYTES = original
 

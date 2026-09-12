@@ -24,9 +24,9 @@ The server acts as an OAuth proxy: it presents itself as an OAuth 2.0 authorizat
 |------|-------------|
 | `get_profile` | Gmail account profile |
 | `search_emails` | Search with Gmail operators (`from:`, `subject:`, `has:attachment`, …). Enriches results up to `SEARCH_ENRICH_LIMIT` — see Configuration below. Use `has:attachment` in the query to filter to messages with attachments — enrichment itself doesn't include attachment info (see the `SEARCH_ENRICH_LIMIT` row below). |
-| `read_message` | Full message with decoded body and attachment metadata (filename/attachmentId/mimeType/size) |
+| `read_message` | Full message with decoded body and attachment metadata (filename/partId/mimeType/size) |
 | `read_thread` | Full thread |
-| `get_attachment` | Download an attachment's bytes (base64) by `message_id`/`attachment_id` from `read_message`'s `attachments` list — see `ATTACHMENT_MAX_MB` |
+| `get_attachment` | Download an attachment's bytes (base64) by `message_id`/`part_id` from `read_message`'s `attachments` list — see `ATTACHMENT_MAX_MB` |
 | `send_email` | Send or reply to a thread |
 | `create_draft` | Save a draft |
 | `list_drafts` | List drafts |
