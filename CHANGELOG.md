@@ -9,8 +9,9 @@ dependency pins, changelog maintenance itself, etc.) are tracked in git commit
 history only, not here. Version numbers are permanent once assigned — removing an
 out-of-scope entry leaves a gap rather than renumbering everything after it, so a
 missing number means an administrative-only change, not a lost entry. No GitHub
-Releases (no external consumers to serve release notes to), but working milestones
-get an annotated git tag (`v0.1`, `v0.2`, …) as a rollback anchor. A date heading
+Releases (no external consumers to serve release notes to), but every version
+entry gets a matching annotated git tag (`v0.1`, `v0.2`, …) as a rollback anchor —
+created at push time, pointing at the commit that introduced it. A date heading
 only appears when the date changes from the entry above it.
 
 ## 2026-09-13
