@@ -6,3 +6,5 @@ __pycache__/
 .venv*/
 TREASURER_MAILBOX_LABEL_RULES.md
 SESSION_HANDOVER.md
+DEPLOYMENT.md
+stratamax-reports/
