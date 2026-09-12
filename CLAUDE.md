@@ -10,3 +10,13 @@ at that commit, then push both the commit and the tags (`git push && git push
 origin --tags`). If several versions land in one commit (the changelog's own
 convention allows this — see its top-of-file note), tag all of them at that same
 commit.
+
+## After every deploy instruction
+
+Whenever giving deployment/redeploy commands for the Proxmox service (see
+`DEPLOYMENT.md`, local-only), always also remind the user of the journalctl
+command to monitor activity afterward:
+
+```bash
+journalctl -u gmail-mcp-proxy -f
+```
