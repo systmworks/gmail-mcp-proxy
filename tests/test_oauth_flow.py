@@ -56,6 +56,25 @@ async def test_authorize_rejects_missing_code_challenge(asgi_client):
     assert r.text == "PKCE code_challenge is required"
 
 
+async def test_authorize_rejects_plain_code_challenge_method(asgi_client):
+    r = await asgi_client.get("/authorize", params={
+        "redirect_uri": "https://claude.ai/api/mcp/auth_callback",
+        "code_challenge": "test-challenge",
+        "code_challenge_method": "plain",
+    })
+    assert r.status_code == 400
+    assert "S256" in r.text
+
+
+async def test_authorize_accepts_explicit_s256_method(asgi_client):
+    r = await asgi_client.get("/authorize", params={
+        "redirect_uri": "https://claude.ai/api/mcp/auth_callback",
+        "code_challenge": "test-challenge",
+        "code_challenge_method": "S256",
+    })
+    assert 300 <= r.status_code < 400
+
+
 async def test_authorize_happy_path_redirects_to_google_and_stores_state(asgi_client):
     r = await asgi_client.get("/authorize", params={
         "redirect_uri": "https://claude.ai/api/mcp/auth_callback",
@@ -73,14 +92,44 @@ async def test_authorize_happy_path_redirects_to_google_and_stores_state(asgi_cl
     assert stored["read_only"] is False
 
 
-async def test_authorize_sets_read_only_when_resource_names_restricted_alias(asgi_client):
+async def test_authorize_sets_read_only_for_restricted_alias_reached_via_url_path(asgi_client):
+    # alias/read_only comes from the server-verified URL path (/work/authorize,
+    # split by _split_alias in _App.__call__), not the client-echoed 'resource'
+    # query param — see the security regression test below for why that matters.
     original = server.READ_ONLY_ALIASES
     server.READ_ONLY_ALIASES = frozenset({"work"})
     try:
-        r = await asgi_client.get("/authorize", params={
+        r = await asgi_client.get("/work/authorize", params={
             "redirect_uri": "https://claude.ai/api/mcp/auth_callback",
             "code_challenge": "test-challenge",
             "resource": "http://test/work/mcp",
+        })
+        assert 300 <= r.status_code < 400
+        our_state = _state_query(r.headers["location"])["state"][0]
+        stored = server._state_store.pop(our_state)
+        assert stored["read_only"] is True
+    finally:
+        server.READ_ONLY_ALIASES = original
+
+
+async def test_authorize_stays_read_only_even_if_client_never_echoes_resource(asgi_client):
+    # SECURITY regression test for the cross-alias token replay bug: _authorize
+    # used to decide read_only from the client-supplied 'resource' query parameter
+    # (via the now-removed _alias_from_resource) instead of the server-verified
+    # alias the request actually came in through. A request hitting /work/authorize
+    # — a READ_ONLY_ALIASES-restricted connector — with NO 'resource' param at all
+    # (an OAuth client that fails to echo it, or simply doesn't send one) used to
+    # silently get read_only=False stored, meaning the resulting Google grant got
+    # full write scope and the minted JWT could be replayed anywhere to bypass the
+    # restriction. It must stay read_only=True regardless of what (if anything)
+    # the client sends as 'resource'.
+    original = server.READ_ONLY_ALIASES
+    server.READ_ONLY_ALIASES = frozenset({"work"})
+    try:
+        r = await asgi_client.get("/work/authorize", params={
+            "redirect_uri": "https://claude.ai/api/mcp/auth_callback",
+            "code_challenge": "test-challenge",
+            # Deliberately omitted: "resource" — or could point anywhere else.
         })
         assert 300 <= r.status_code < 400
         our_state = _state_query(r.headers["location"])["state"][0]
@@ -141,6 +190,42 @@ async def test_auth_callback_returns_502_on_userinfo_failure(asgi_client, state)
 
 
 @respx.mock
+async def test_auth_callback_token_exchange_retries_transient_5xx(asgi_client, state):
+    # Regression coverage: the token-exchange call used a raw c.post(), bypassing
+    # _request_with_retry entirely — a transient 5xx during this one-time
+    # authorization-code exchange used to fail the whole login instead of
+    # transparently retrying like every other outbound call in the file.
+    route = respx.post("https://oauth2.googleapis.com/token").mock(side_effect=[
+        httpx.Response(503),
+        httpx.Response(200, json={
+            "access_token": "gtok", "refresh_token": "rtok", "expires_in": 3600,
+        }),
+    ])
+    respx.get("https://www.googleapis.com/oauth2/v3/userinfo").mock(
+        return_value=httpx.Response(200, json={"email": "a@example.com"})
+    )
+    r = await asgi_client.get("/auth/callback", params={"state": state, "code": "google-code"})
+    assert route.call_count == 2
+    assert 300 <= r.status_code < 400
+
+
+@respx.mock
+async def test_auth_callback_userinfo_retries_transient_5xx(asgi_client, state):
+    respx.post("https://oauth2.googleapis.com/token").mock(
+        return_value=httpx.Response(200, json={
+            "access_token": "gtok", "refresh_token": "rtok", "expires_in": 3600,
+        })
+    )
+    route = respx.get("https://www.googleapis.com/oauth2/v3/userinfo").mock(side_effect=[
+        httpx.Response(503),
+        httpx.Response(200, json={"email": "a@example.com"}),
+    ])
+    r = await asgi_client.get("/auth/callback", params={"state": state, "code": "google-code"})
+    assert route.call_count == 2
+    assert 300 <= r.status_code < 400
+
+
+@respx.mock
 async def test_auth_callback_happy_path_creates_session_and_redirects(asgi_client, state):
     respx.post("https://oauth2.googleapis.com/token").mock(
         return_value=httpx.Response(200, json={
@@ -188,6 +273,30 @@ async def test_refresh_pops_session_and_raises_on_failed_refresh():
         await server._refresh(jti)
     assert jti not in server._token_store
     assert jti not in server._refresh_locks
+
+
+@respx.mock
+async def test_refresh_retries_transient_5xx_and_recovers():
+    # Regression coverage: _refresh used a raw c.post(), bypassing
+    # _request_with_retry — a single transient 5xx during a routine access-token
+    # refresh used to force a full re-auth flow, even though the identical error
+    # on a write-tool call would have been retried.
+    jti = "jti-retry"
+    server._token_store[jti] = {
+        "access_token": "old", "refresh_token": "rtok",
+        "expiry": time.time() - 100, "email": "a@example.com", "jwt_exp": time.time() + 1000,
+    }
+    route = respx.post("https://oauth2.googleapis.com/token").mock(side_effect=[
+        httpx.Response(503),
+        httpx.Response(200, json={"access_token": "new-token", "expires_in": 3600}),
+    ])
+    try:
+        result = await server._refresh(jti)
+        assert result == "new-token"
+        assert route.call_count == 2
+    finally:
+        server._token_store.pop(jti, None)
+        server._refresh_locks.pop(jti, None)
 
 
 @respx.mock
@@ -324,5 +433,66 @@ async def test_mcp_endpoint_alias_routing_authenticates_through_split_alias(asgi
     finally:
         server.app._mcp = original_mcp
         server.READ_ONLY_ALIASES = original_aliases
+        server._token_store.pop(jti, None)
+        server._refresh_locks.pop(jti, None)
+
+
+# ── _purge_expired_tokens ───────────────────────────────────────────────────
+
+@respx.mock
+async def test_purge_does_not_evict_session_with_in_flight_refresh():
+    # Regression test for the token-purge race: _purge_expired_tokens runs on
+    # every incoming HTTP request (not just ones for the session being purged).
+    # If a session's jwt_exp elapses while _refresh() is mid-flight for that same
+    # session — awaiting Google's response — an unconditional pop used to remove
+    # the entry out from under it: _refresh then writes the new token into a dict
+    # no longer referenced by _token_store, silently losing the session despite
+    # _refresh reporting success.
+    jti = "jti-purge-race"
+    server._token_store[jti] = {
+        "access_token": "old", "refresh_token": "rtok",
+        "expiry": time.time() - 10,     # Google access token needs refresh now
+        "email": "a@example.com",
+        "jwt_exp": time.time() + 0.3,   # about to elapse while refresh is in-flight
+    }
+    refresh_started = asyncio.Event()
+
+    async def slow_google_response(request):
+        refresh_started.set()
+        await asyncio.sleep(0.6)
+        return httpx.Response(200, json={"access_token": "new-token", "expires_in": 3600})
+
+    respx.post("https://oauth2.googleapis.com/token").mock(side_effect=slow_google_response)
+
+    try:
+        refresh_task = asyncio.create_task(server._refresh(jti))
+        await refresh_started.wait()
+
+        await asyncio.sleep(0.4)  # now past jwt_exp; refresh still sleeping (0.6s)
+        assert time.time() >= server._token_store[jti]["jwt_exp"]
+        server._purge_expired_tokens()
+
+        # The fix: purge must skip a session whose refresh lock is currently held.
+        assert jti in server._token_store
+
+        result = await refresh_task
+        assert result == "new-token"
+        assert server._token_store[jti]["access_token"] == "new-token"
+    finally:
+        server._token_store.pop(jti, None)
+        server._refresh_locks.pop(jti, None)
+
+
+async def test_purge_evicts_expired_session_with_no_in_flight_refresh():
+    jti = "jti-purge-normal"
+    server._token_store[jti] = {
+        "access_token": "old", "refresh_token": "rtok",
+        "expiry": time.time() + 3600, "email": "a@example.com",
+        "jwt_exp": time.time() - 1,  # already expired, no refresh in progress
+    }
+    try:
+        server._purge_expired_tokens()
+        assert jti not in server._token_store
+    finally:
         server._token_store.pop(jti, None)
         server._refresh_locks.pop(jti, None)

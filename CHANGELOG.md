@@ -13,6 +13,182 @@ Releases (no external consumers to serve release notes to), but working mileston
 get a lightweight git tag (`v0.1`, `v0.2`, …) as a rollback anchor. A date heading
 only appears when the date changes from the entry above it.
 
+## 2026-09-13
+
+### 0.38 — Cleanup: safe attachment data access, consolidated request boilerplate
+
+Follow-up from a broader code review (see 0.31-0.37) that ported 13 confirmed bugs
+found reviewing sibling project outlook-mcp-proxy, plus two lower-priority cleanups
+noted in the same pass.
+
+**Fixed**
+- `get_attachment` used `r2.json()["data"]` (direct key access) instead of
+  `.get("data")` — an unhandled `KeyError` instead of a clear error if a Gmail
+  attachment response were ever missing `data`. Now raises a `ValueError` naming
+  the attachment.
+
+**Changed**
+- The `c = _client(); r = await c.get/post(...); r.raise_for_status(); return
+  r.json()` (or `.get("drafts"/"labels"/"items", [])`) shape repeated across every
+  tool function. Consolidated into `_call`/`_call_json`/`_call_list`/`_call_delete`
+  helpers (auth header injection + retry + raise-for-status in one place), and
+  rewrote every tool to use them. `delete_draft`/`delete_label`'s redundant `if
+  r.status_code != 204: r.raise_for_status()` check is gone as a side effect — it
+  was provably a no-op (`raise_for_status()` only ever raises on 4xx/5xx regardless
+  of which specific 2xx code a delete endpoint returns, and neither function called
+  `.json()` afterward anyway).
+
+### 0.37 — Fix token-purge race with an in-flight refresh
+
+**Fixed**
+- `_purge_expired_tokens` runs on *every* incoming HTTP request (not just ones for
+  the session being purged) and popped `_token_store`/`_refresh_locks` entries
+  unconditionally. If a session's `jwt_exp` elapsed while `_refresh` was mid-flight
+  awaiting Google's response for that same session, a concurrent request's purge
+  call could pop the entry out from under it — when the refresh then resolved, it
+  wrote the new token into a dict no longer referenced by `_token_store`, silently
+  losing the session despite `_refresh` reporting success. Reproduced directly with
+  a mocked delayed Google response before fixing: `_purge_expired_tokens` now skips
+  a session whose refresh lock is currently held, deferring the purge to the next
+  pass once the in-flight refresh releases it.
+- `tests/test_oauth_flow.py`: regression test reproducing the exact race (delayed
+  mocked token response, purge fired mid-refresh, session must survive) plus a
+  sanity test that a genuinely idle expired session still gets purged normally.
+
+### 0.36 — Robustness batch: UTF-8 header encoding, client reset, PKCE method, dead code
+
+Four small, independent fixes from the same review pass landing together.
+
+**Fixed**
+- `_www_auth_header`'s `.encode()` used strict UTF-8 error handling — a lone
+  surrogate character in the `alias` segment (which ASGI servers can produce via
+  surrogateescape decoding of an invalid-UTF-8 path, per the ASGI spec) would raise
+  an unhandled `UnicodeEncodeError` instead of the intended 401. Now
+  `.encode("utf-8", errors="replace")`, matching the same defensive fix already
+  applied to inbound `Authorization` header decoding (0.22). Confirmed the crash
+  reproduces in isolation with a literal lone-surrogate string; live-tested this
+  server's actual Uvicorn deployment against both a raw invalid byte and a
+  percent-encoded one in the path and found neither currently reaches this code
+  path with a surrogate in practice — fixed anyway as defense-in-depth against
+  other ASGI servers/proxies that may decode differently.
+- `_http_client` was never reset to `None` after `aclose()` in the ASGI lifespan
+  shutdown handler, so any request task still running during shutdown would get a
+  closed client from `_client()` instead of the intended clean "not initialized"
+  `RuntimeError`.
+- `_authorize` never validated `code_challenge_method`, even though the advertised
+  OAuth metadata already declares `S256` as the only supported method and `_pkce_ok`
+  only ever implements S256. A client attempting the insecure `plain` method now
+  gets a clear 400 instead of a generic `invalid_grant` later at `/token` (no actual
+  bypass existed either way — S256-only verification was already enforced there).
+- Removed the dead `_user_email` `ContextVar` — set on every authenticated request,
+  never read anywhere in the file or test suite.
+- `tests/test_helpers.py`, `tests/test_oauth_flow.py`: coverage for the PKCE method
+  rejection; the UTF-8 encoding fix and dead-code removal are exercised by existing
+  tests continuing to pass (no new failure mode to regression-test once fixed).
+
+### 0.35 — Harden against non-canonical paths bypassing the bearer-auth gate
+
+**Fixed**
+- A path like `//mcp` matched neither a known OAuth path nor the `/mcp` bearer-auth
+  gate's exact-prefix check (`_split_alias` doesn't collapse repeated slashes), so
+  the request fell through with no auth check performed at all — relying entirely
+  on downstream FastMCP/Starlette routing behavior to not also treat `//mcp` as
+  equivalent to `/mcp`. Verified live against this server's actual stack: it
+  independently 404s `//mcp` rather than routing it to an authenticated endpoint,
+  so no bypass exists today — fixed anyway since that's downstream behavior this
+  file has no control over, not a guarantee. Added `_normalize_path` (collapses
+  repeated slashes via regex) and call it on the incoming path before
+  `_split_alias` runs.
+- `tests/test_helpers.py`: coverage for `_normalize_path` and for `_split_alias`
+  correctly treating a normalized `//mcp` as the plain unaliased `/mcp` route.
+
+### 0.34 — URL-encode ids interpolated into REST API paths
+
+**Fixed**
+- Every id (`message_id`, `thread_id`, `draft_id`, `label_id`, `calendar_id`,
+  `event_id`, `attachment_id`) was interpolated raw into Gmail/Calendar REST URL
+  path segments with no encoding. Google's own generated ids are base64url (no `/`
+  by construction) so this was low-risk in practice, but `calendar_id` in
+  particular is caller-supplied and can be an arbitrary string (e.g. an email
+  address used as a calendar id) — added an `_enc()` helper
+  (`urllib.parse.quote(value, safe="")`) and applied it to every id interpolated
+  into a URL path (never into a JSON request body field, where it doesn't apply).
+- `tests/test_helpers.py`, `tests/test_server.py`: coverage for `_enc` itself and
+  for `read_message`/`get_event` actually applying it end-to-end.
+
+### 0.33 — Fix READ_ONLY_ALIASES parsing accepting a stray slash as an alias
+
+**Fixed**
+- `READ_ONLY_ALIASES`'s parsing filtered on `a.strip()` but yielded
+  `a.strip().strip("/")` — a slash-only token (e.g. a stray `/` in the env value)
+  passed the filter (non-empty after whitespace-strip) but collapsed to `""` once
+  slashes were also stripped, silently inserting the empty string — the alias of
+  the *unaliased* connector — into the restricted set. Extracted into a standalone,
+  directly-testable `_parse_read_only_aliases` using a walrus operator to filter on
+  the *final* value instead. (The bug could only ever make the unaliased connector
+  spuriously read-only, never relax an intended restriction — fail-safe, not
+  fail-open — but worth fixing regardless.)
+- `tests/test_helpers.py`: coverage for the exact divergent-filter scenario, plus
+  basic parsing and whitespace/slash-stripping behavior.
+
+### 0.32 — Harden retry behavior: don't retry writes on network error, do retry reads
+
+Ported findings from the same outlook-mcp-proxy code review (see 0.31).
+
+**Fixed**
+- `_request_with_retry` caught `httpx.HTTPError` (network-level errors — timeouts,
+  connection resets, not just HTTP status) and retried unconditionally. Whether the
+  original request already landed server-side before a network error is ambiguous;
+  blindly retrying a non-idempotent write (`send_email`, `create_draft`, etc.)
+  risked silently duplicating it. Network errors now propagate immediately instead
+  of being retried; only a definite retryable HTTP status (429/5xx) is retried.
+- `_refresh` and `_auth_callback`'s Google token-exchange/userinfo calls used raw
+  `c.post()`/`c.get()`, bypassing the retry helper entirely — a single transient
+  5xx during a routine access-token refresh, or during the one-time
+  authorization-code exchange right after the user completes Google's consent
+  screen, failed outright instead of transparently retrying like every other
+  outbound call in the file. Both now route through `_request_with_retry`.
+- Every read tool (`get_profile`, `search_emails`'s message-list call,
+  `read_message`, `read_thread`, `list_drafts`, `list_labels`, `list_calendars`,
+  `list_events`, `search_events`, `get_event`, `get_attachment`) went straight
+  through `_client()`, never through the retry helper — a transient 429/503 failed
+  the call outright with no recovery, backward from what matters since GETs are
+  idempotent and the safest calls to retry. All now go through the same retry
+  helper as writes (safe to do uniformly now that it no longer retries network
+  errors). `search_emails`'s per-message enrichment retry
+  (`SEARCH_ENRICH_ATTEMPTS`) is a separate, already-reviewed degrade-gracefully
+  path and was deliberately left untouched.
+- `tests/test_server.py`, `tests/test_oauth_flow.py`: coverage for read tools
+  recovering from a transient 5xx, `_refresh`/`_auth_callback` doing the same, and
+  a write tool no longer retrying (and no longer risking duplication) on a network
+  error.
+
+### 0.31 — Fix cross-alias token replay bypassing READ_ONLY_ALIASES restriction (SECURITY)
+
+A line-by-line comparison against sibling project outlook-mcp-proxy (same
+dual-role OAuth-proxy architecture, four rounds of code review, 18 confirmed bugs)
+found 13 of those bugs present here too. This is the security-relevant one; see
+0.32-0.38 for the rest.
+
+**Fixed**
+- `_authorize` decided `read_only` from the **client-echoed** `resource` query
+  parameter (via `_alias_from_resource`) instead of the **server-verified**
+  `req.state.alias` already used correctly a few lines away by
+  `_protected_resource` for exactly this purpose. If an OAuth client ever failed to
+  echo `resource` correctly during a restricted-alias authorization flow (e.g.
+  `/work/authorize`) — or simply omitted it — the resulting Google OAuth grant got
+  full write scope and the minted JWT got `read_only=False`; since that claim, not
+  which alias the token was created for, is what travels with the token
+  afterward, presenting the same token elsewhere bypassed the restriction entirely.
+  Reproduced directly (a request through `/work/authorize` with no `resource` param
+  stored `read_only=False`) before fixing. `_authorize` now reads `req.state.alias`
+  directly, matching `_protected_resource`; the now-dead `_alias_from_resource`
+  helper and its dedicated tests were removed.
+- `tests/test_oauth_flow.py`: regression test reproducing the exact scenario (a
+  restricted alias with no `resource` param must still store `read_only=True`), and
+  the existing resource-echoing test rewritten to exercise the real `/work/authorize`
+  path instead of the no-longer-relevant client-supplied `resource` parsing.
+
 ## 2026-09-12
 
 ### 0.30 — Fix get_attachment: Gmail's attachmentId is not stable across calls

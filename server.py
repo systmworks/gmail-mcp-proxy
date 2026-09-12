@@ -11,12 +11,13 @@ import hashlib
 import hmac
 import logging
 import os
+import re
 import secrets
 import time
 from contextvars import ContextVar
 from email.mime.text import MIMEText
 from typing import Any
-from urllib.parse import urlencode, urlparse
+from urllib.parse import quote, urlencode
 
 import httpx
 import jwt
@@ -71,12 +72,23 @@ ALLOWED_REDIRECT_URIS = frozenset(
     ).split(",") if u.strip()
 )
 
+def _parse_read_only_aliases(value: str) -> frozenset[str]:
+    """Split a comma-separated READ_ONLY_ALIASES value into a set of bare alias
+    names. Filters on the *final* stripped value (walrus operator) rather than on
+    an intermediate one — a naive `a.strip().strip("/") for a in ... if a.strip()`
+    can pass its own filter on a slash-only token (e.g. a stray "/") whose
+    whitespace-only strip is truthy, then collapse to "" once slashes are also
+    stripped, silently inserting the empty string (the *unaliased* connector's own
+    alias) into the restricted set."""
+    return frozenset(
+        stripped for a in value.split(",")
+        if (stripped := a.strip().strip("/"))
+    )
+
+
 # Aliased connectors (e.g. /work/mcp) named here get Google scopes covering only
-# read access — see _google_scopes() and _alias_from_resource() below.
-READ_ONLY_ALIASES = frozenset(
-    a.strip().strip("/") for a in os.environ.get("READ_ONLY_ALIASES", "").split(",")
-    if a.strip()
-)
+# read access — see _google_scopes() below.
+READ_ONLY_ALIASES = _parse_read_only_aliases(os.environ.get("READ_ONLY_ALIASES", ""))
 
 GOOGLE_SCOPES_BASE = [
     "openid",
@@ -133,13 +145,22 @@ _refresh_locks: dict[str, asyncio.Lock] = {}  # jti → lock guarding concurrent
 # ── Per-request context ────────────────────────────────────────────────────────
 
 _session_jti: ContextVar[str] = ContextVar("session_jti", default="")
-_user_email: ContextVar[str] = ContextVar("user_email", default="")
 _read_only: ContextVar[bool] = ContextVar("read_only", default=False)
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 class ReauthRequired(Exception):
     """Raised when a session is unknown or Google has revoked/expired the refresh token."""
+
+
+def _enc(value: str) -> str:
+    """URL-encode a value before interpolating it into a REST URL *path* segment
+    (never into a JSON request body field, where it doesn't apply). Google's own
+    generated ids are base64url (no "/" by construction) so this rarely bites in
+    practice, but calendar_id in particular can be an arbitrary caller-supplied
+    string (e.g. an email address used as a calendar id) — encode unconditionally
+    rather than relying on how unlikely a literal "/" is today."""
+    return quote(str(value), safe="")
 
 
 def _pkce_ok(verifier: str, challenge: str) -> bool:
@@ -159,9 +180,20 @@ def _purge_expired_states() -> None:
 
 
 def _purge_expired_tokens() -> None:
+    # Runs on every incoming HTTP request (not just ones for the session being
+    # purged), so a session's jwt_exp elapsing while _refresh() is mid-flight for
+    # that same session — awaiting Google's response — could otherwise have this
+    # pop the entry out from under it: _refresh then writes the new token into a
+    # dict no longer referenced by _token_store, silently losing the session
+    # despite _refresh reporting success. Skip a session whose refresh lock is
+    # currently held; the next purge pass (on the next request) will catch it once
+    # the in-flight refresh finishes and releases the lock.
     now = time.time()
     expired = [jti for jti, d in _token_store.items() if now >= d.get("jwt_exp", float("inf"))]
     for jti in expired:
+        lock = _refresh_locks.get(jti)
+        if lock is not None and lock.locked():
+            continue
         _token_store.pop(jti, None)
         _refresh_locks.pop(jti, None)
 
@@ -177,8 +209,7 @@ async def _refresh(jti: str) -> str:
         if time.time() < d["expiry"] - 60:
             # Another coroutine already refreshed while we waited on the lock.
             return d["access_token"]
-        c = _client()
-        r = await c.post("https://oauth2.googleapis.com/token", data={
+        r = await _request_with_retry("POST", "https://oauth2.googleapis.com/token", data={
             "client_id": GOOGLE_CLIENT_ID,
             "client_secret": GOOGLE_CLIENT_SECRET,
             "refresh_token": d["refresh_token"],
@@ -226,26 +257,23 @@ async def _auth() -> dict:
 
 
 async def _request_with_retry(method: str, url: str, **kwargs: Any) -> httpx.Response:
-    """Write-tool API call with retry — up to API_RETRY_ATTEMPTS total tries on
-    network errors or retryable statuses (429, 5xx) before giving up. Callers keep
-    calling r.raise_for_status() as before: a final retryable-status response is
-    returned as-is (so that still raises), a final network error is re-raised."""
+    """API call with retry — up to API_RETRY_ATTEMPTS total tries on a definite
+    retryable HTTP status (429, 5xx) before giving up. Callers keep calling
+    r.raise_for_status() as before: a final retryable-status response is returned
+    as-is (so that still raises).
+
+    Network-level errors (timeouts, connection resets) are NOT retried — they
+    propagate immediately. Whether the request already landed server-side before
+    the error is ambiguous, and blindly retrying a non-idempotent write
+    (send_email, create_draft, etc.) risks silently duplicating it."""
     c = _client()
-    last_exc: httpx.HTTPError | None = None
     r: httpx.Response | None = None
     for attempt in range(1, API_RETRY_ATTEMPTS + 1):
-        try:
-            r = await c.request(method, url, **kwargs)
-            last_exc = None
-        except httpx.HTTPError as e:
-            last_exc = e
-            r = None
-        if r is not None and r.status_code not in _RETRYABLE_STATUSES:
+        r = await c.request(method, url, **kwargs)
+        if r.status_code not in _RETRYABLE_STATUSES:
             return r
         if attempt < API_RETRY_ATTEMPTS:
             await asyncio.sleep(_API_RETRY_DELAY)
-    if last_exc is not None:
-        raise last_exc
     assert r is not None
     return r
 
@@ -262,18 +290,6 @@ def _effective_read_only(payload: dict, alias: str) -> bool:
     here comes from server-side path routing (_split_alias), not anything the
     client asserts, so this can't be bypassed by client behavior."""
     return payload.get("read_only", False) or alias in READ_ONLY_ALIASES
-
-
-def _alias_from_resource(resource: str | None) -> str:
-    """Extract the alias segment from an OAuth 'resource' parameter (RFC 8707), e.g.
-    https://host/work/mcp -> "work". Returns "" if absent/unparseable/unaliased —
-    same as an unrestricted connector."""
-    if not resource:
-        return ""
-    segments = urlparse(resource).path.strip("/").split("/")
-    if len(segments) == 2 and segments[1] == "mcp":
-        return segments[0]
-    return ""
 
 
 def _build_email(to: str, subject: str, body: str, cc: str = "",
@@ -332,13 +348,35 @@ def _find_part_by_id(part: dict, part_id: str) -> dict | None:
 mcp = FastMCP("Gmail MCP")
 
 
+async def _call(method: str, url: str, **kwargs: Any) -> httpx.Response:
+    """Shared auth + retry + raise-for-status boilerplate for every Gmail/Calendar
+    API call, read or write alike — both go through the same _request_with_retry
+    (see its own docstring for exactly what it does and doesn't retry)."""
+    r = await _request_with_retry(method, url, headers=await _auth(), **kwargs)
+    r.raise_for_status()
+    return r
+
+
+async def _call_json(method: str, url: str, **kwargs: Any) -> dict:
+    return (await _call(method, url, **kwargs)).json()
+
+
+async def _call_list(method: str, url: str, key: str, **kwargs: Any) -> list[dict]:
+    return (await _call(method, url, **kwargs)).json().get(key, [])
+
+
+async def _call_delete(method: str, url: str, deleted_id: str, **kwargs: Any) -> dict:
+    # raise_for_status() only ever raises on 4xx/5xx regardless of which specific
+    # 2xx code a delete endpoint returns (200 vs 204) — no special-casing needed,
+    # and neither caller wants the (possibly-empty) response body anyway.
+    await _call(method, url, **kwargs)
+    return {"deleted": deleted_id}
+
+
 @mcp.tool
 async def get_profile() -> dict:
     """Get the authenticated Gmail account's profile."""
-    c = _client()
-    r = await c.get(f"{GMAIL}/profile", headers=await _auth())
-    r.raise_for_status()
-    return r.json()
+    return await _call_json("GET", f"{GMAIL}/profile")
 
 
 @mcp.tool
@@ -348,17 +386,18 @@ async def search_emails(query: str, max_results: int = 20) -> list[dict]:
     from/to/subject/date/snippet/labels alongside id/threadId, so most questions about the
     results don't need a follow-up read_message call. Beyond that limit, only id/threadId
     are included."""
-    c = _client()
-    r = await c.get(f"{GMAIL}/messages", headers=await _auth(),
-                    params={"q": query, "maxResults": max_results})
-    r.raise_for_status()
-    messages = r.json().get("messages", [])
+    messages = (await _call_json("GET", f"{GMAIL}/messages",
+                                 params={"q": query, "maxResults": max_results})).get("messages", [])
 
     to_enrich, rest = messages[:SEARCH_ENRICH_LIMIT], messages[SEARCH_ENRICH_LIMIT:]
 
     async def _fetch_metadata(message_id: str) -> httpx.Response | None:
+        # Deliberately NOT routed through _call/_request_with_retry — _enrich just
+        # below already implements its own retry loop (SEARCH_ENRICH_ATTEMPTS) with
+        # degrade-to-bare-id-on-exhaustion semantics that predate and differ from
+        # the generic retry helper; kept as its own reviewed, separately-tested path.
         try:
-            return await c.get(f"{GMAIL}/messages/{message_id}", headers=await _auth(),
+            return await _client().get(f"{GMAIL}/messages/{_enc(message_id)}", headers=await _auth(),
                                params={"format": "metadata",
                                        "metadataHeaders": ["From", "To", "Subject", "Date"]})
         except httpx.HTTPError:
@@ -408,11 +447,7 @@ async def read_message(message_id: str) -> dict:
     """Read a Gmail message by ID. Returns headers, decoded body, and attachment
     metadata (filename/partId/mimeType/size) — use get_attachment to download
     an attachment's bytes."""
-    c = _client()
-    r = await c.get(f"{GMAIL}/messages/{message_id}", headers=await _auth(),
-                    params={"format": "full"})
-    r.raise_for_status()
-    data = r.json()
+    data = await _call_json("GET", f"{GMAIL}/messages/{_enc(message_id)}", params={"format": "full"})
 
     def _find_bodies(part: dict, found: dict) -> None:
         # Single recursive pass collecting both text/plain and text/html (e.g.
@@ -457,10 +492,7 @@ async def read_thread(thread_id: str) -> dict:
     # Intentionally a raw passthrough (unlike read_message) — each message's raw
     # payload already contains attachment parts (filename/partId/size) in its MIME
     # tree; get_attachment works from any message's own "id" here.
-    c = _client()
-    r = await c.get(f"{GMAIL}/threads/{thread_id}", headers=await _auth())
-    r.raise_for_status()
-    return r.json()
+    return await _call_json("GET", f"{GMAIL}/threads/{_enc(thread_id)}")
 
 
 @mcp.tool
@@ -468,11 +500,8 @@ async def get_attachment(message_id: str, part_id: str) -> dict:
     """Download a Gmail attachment's bytes (as standard base64) by message_id and
     partId from read_message's attachments list. Rejects attachments larger than
     ATTACHMENT_MAX_MB without downloading them."""
-    c = _client()
-    r = await c.get(f"{GMAIL}/messages/{message_id}", headers=await _auth(),
-                    params={"format": "full"})
-    r.raise_for_status()
-    payload = r.json().get("payload", {})
+    payload = (await _call_json("GET", f"{GMAIL}/messages/{_enc(message_id)}",
+                                params={"format": "full"})).get("payload", {})
 
     part = _find_part_by_id(payload, part_id)
     if part is None or not part.get("filename") or not part.get("body", {}).get("attachmentId"):
@@ -489,10 +518,11 @@ async def get_attachment(message_id: str, part_id: str) -> dict:
             f"ATTACHMENT_MAX_MB ({ATTACHMENT_MAX_MB}MB) limit"
         )
 
-    r2 = await c.get(f"{GMAIL}/messages/{message_id}/attachments/{attachment_id}",
-                     headers=await _auth())
-    r2.raise_for_status()
-    raw = base64.urlsafe_b64decode(r2.json()["data"] + "==")
+    att = await _call_json("GET", f"{GMAIL}/messages/{_enc(message_id)}/attachments/{_enc(attachment_id)}")
+    raw_data = att.get("data")
+    if raw_data is None:
+        raise ValueError(f"attachment {filename!r} response from Gmail is missing its 'data' field")
+    raw = base64.urlsafe_b64decode(raw_data + "==")
     if len(raw) > ATTACHMENT_MAX_BYTES:
         raise ValueError(
             f"attachment {filename!r} is {len(raw)} bytes, exceeds "
@@ -518,14 +548,11 @@ async def send_email(to: str, subject: str, body: str, cc: str = "",
     in_reply_to = ""
     references = ""
     if reply_to_message_id:
-        c = _client()
-        r = await c.get(f"{GMAIL}/messages/{reply_to_message_id}", headers=await _auth(),
-                        params={"format": "metadata",
-                                "metadataHeaders": ["Message-ID", "References"]})
-        # Fail loudly rather than silently sending an unthreaded standalone email
-        # when the caller explicitly asked for a reply.
-        r.raise_for_status()
-        msg = r.json()
+        # Fail loudly (via _call's raise_for_status) rather than silently sending
+        # an unthreaded standalone email when the caller explicitly asked for a reply.
+        msg = await _call_json("GET", f"{GMAIL}/messages/{_enc(reply_to_message_id)}",
+                               params={"format": "metadata",
+                                       "metadataHeaders": ["Message-ID", "References"]})
         thread_id = msg.get("threadId", "")
         hdrs = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
         in_reply_to = hdrs.get("Message-ID", "")
@@ -534,39 +561,28 @@ async def send_email(to: str, subject: str, body: str, cc: str = "",
     payload: dict = {"raw": _build_email(to, subject, body, cc, in_reply_to, references)}
     if thread_id:
         payload["threadId"] = thread_id
-    r = await _request_with_retry("POST", f"{GMAIL}/messages/send", headers=await _auth(), json=payload)
-    r.raise_for_status()
-    return r.json()
+    return await _call_json("POST", f"{GMAIL}/messages/send", json=payload)
 
 
 @mcp.tool
 async def create_draft(to: str, subject: str, body: str, cc: str = "") -> dict:
     """Create a Gmail draft."""
     _require_write()
-    r = await _request_with_retry("POST", f"{GMAIL}/drafts", headers=await _auth(),
-                                  json={"message": {"raw": _build_email(to, subject, body, cc)}})
-    r.raise_for_status()
-    return r.json()
+    return await _call_json("POST", f"{GMAIL}/drafts",
+                            json={"message": {"raw": _build_email(to, subject, body, cc)}})
 
 
 @mcp.tool
 async def list_drafts(max_results: int = 10) -> list[dict]:
     """List Gmail drafts."""
-    c = _client()
-    r = await c.get(f"{GMAIL}/drafts", headers=await _auth(),
-                    params={"maxResults": max_results})
-    r.raise_for_status()
-    return r.json().get("drafts", [])
+    return await _call_list("GET", f"{GMAIL}/drafts", "drafts", params={"maxResults": max_results})
 
 
 @mcp.tool
 async def send_draft(draft_id: str) -> dict:
     """Send an existing Gmail draft."""
     _require_write()
-    r = await _request_with_retry("POST", f"{GMAIL}/drafts/send", headers=await _auth(),
-                                  json={"id": draft_id})
-    r.raise_for_status()
-    return r.json()
+    return await _call_json("POST", f"{GMAIL}/drafts/send", json={"id": draft_id})
 
 
 @mcp.tool
@@ -574,29 +590,21 @@ async def update_draft(draft_id: str, to: str, subject: str, body: str,
                        cc: str = "") -> dict:
     """Replace the content of an existing Gmail draft."""
     _require_write()
-    r = await _request_with_retry("PUT", f"{GMAIL}/drafts/{draft_id}", headers=await _auth(),
-                                  json={"message": {"raw": _build_email(to, subject, body, cc)}})
-    r.raise_for_status()
-    return r.json()
+    return await _call_json("PUT", f"{GMAIL}/drafts/{_enc(draft_id)}",
+                            json={"message": {"raw": _build_email(to, subject, body, cc)}})
 
 
 @mcp.tool
 async def delete_draft(draft_id: str) -> dict:
     """Permanently delete a Gmail draft."""
     _require_write()
-    r = await _request_with_retry("DELETE", f"{GMAIL}/drafts/{draft_id}", headers=await _auth())
-    if r.status_code != 204:
-        r.raise_for_status()
-    return {"deleted": draft_id}
+    return await _call_delete("DELETE", f"{GMAIL}/drafts/{_enc(draft_id)}", draft_id)
 
 
 @mcp.tool
 async def list_labels() -> list[dict]:
     """List all Gmail labels."""
-    c = _client()
-    r = await c.get(f"{GMAIL}/labels", headers=await _auth())
-    r.raise_for_status()
-    return r.json().get("labels", [])
+    return await _call_list("GET", f"{GMAIL}/labels", "labels")
 
 
 @mcp.tool
@@ -604,12 +612,10 @@ async def create_label(name: str, label_list_visibility: str = "labelShow",
                        message_list_visibility: str = "show") -> dict:
     """Create a new Gmail label."""
     _require_write()
-    r = await _request_with_retry("POST", f"{GMAIL}/labels", headers=await _auth(),
-                                  json={"name": name,
-                                        "labelListVisibility": label_list_visibility,
-                                        "messageListVisibility": message_list_visibility})
-    r.raise_for_status()
-    return r.json()
+    return await _call_json("POST", f"{GMAIL}/labels",
+                            json={"name": name,
+                                  "labelListVisibility": label_list_visibility,
+                                  "messageListVisibility": message_list_visibility})
 
 
 @mcp.tool
@@ -625,19 +631,14 @@ async def update_label(label_id: str, name: str | None = None,
         body["labelListVisibility"] = label_list_visibility
     if message_list_visibility is not None:
         body["messageListVisibility"] = message_list_visibility
-    r = await _request_with_retry("PATCH", f"{GMAIL}/labels/{label_id}", headers=await _auth(), json=body)
-    r.raise_for_status()
-    return r.json()
+    return await _call_json("PATCH", f"{GMAIL}/labels/{_enc(label_id)}", json=body)
 
 
 @mcp.tool
 async def delete_label(label_id: str) -> dict:
     """Permanently delete a Gmail label."""
     _require_write()
-    r = await _request_with_retry("DELETE", f"{GMAIL}/labels/{label_id}", headers=await _auth())
-    if r.status_code != 204:
-        r.raise_for_status()
-    return {"deleted": label_id}
+    return await _call_delete("DELETE", f"{GMAIL}/labels/{_enc(label_id)}", label_id)
 
 
 @mcp.tool
@@ -645,38 +646,29 @@ async def modify_labels(message_id: str, add: list[str] | None = None,
                         remove: list[str] | None = None) -> dict:
     """Add or remove labels on a Gmail message."""
     _require_write()
-    r = await _request_with_retry("POST", f"{GMAIL}/messages/{message_id}/modify", headers=await _auth(),
-                                  json={"addLabelIds": add or [], "removeLabelIds": remove or []})
-    r.raise_for_status()
-    return r.json()
+    return await _call_json("POST", f"{GMAIL}/messages/{_enc(message_id)}/modify",
+                            json={"addLabelIds": add or [], "removeLabelIds": remove or []})
 
 
 @mcp.tool
 async def report_phishing(message_id: str) -> dict:
     """Mark a Gmail message as spam."""
     _require_write()
-    r = await _request_with_retry("POST", f"{GMAIL}/messages/{message_id}/modify", headers=await _auth(),
-                                  json={"addLabelIds": ["SPAM"], "removeLabelIds": ["INBOX"]})
-    r.raise_for_status()
-    return r.json()
+    return await _call_json("POST", f"{GMAIL}/messages/{_enc(message_id)}/modify",
+                            json={"addLabelIds": ["SPAM"], "removeLabelIds": ["INBOX"]})
 
 
 @mcp.tool
 async def trash_message(message_id: str) -> dict:
     """Move a Gmail message to trash."""
     _require_write()
-    r = await _request_with_retry("POST", f"{GMAIL}/messages/{message_id}/trash", headers=await _auth())
-    r.raise_for_status()
-    return r.json()
+    return await _call_json("POST", f"{GMAIL}/messages/{_enc(message_id)}/trash")
 
 
 @mcp.tool
 async def list_calendars() -> list[dict]:
     """List all Google Calendars."""
-    c = _client()
-    r = await c.get(f"{GCAL}/users/me/calendarList", headers=await _auth())
-    r.raise_for_status()
-    return r.json().get("items", [])
+    return await _call_list("GET", f"{GCAL}/users/me/calendarList", "items")
 
 
 @mcp.tool
@@ -688,32 +680,21 @@ async def list_events(calendar_id: str = "primary", time_min: str = "",
         params["timeMin"] = time_min
     if time_max:
         params["timeMax"] = time_max
-    c = _client()
-    r = await c.get(f"{GCAL}/calendars/{calendar_id}/events",
-                    headers=await _auth(), params=params)
-    r.raise_for_status()
-    return r.json().get("items", [])
+    return await _call_list("GET", f"{GCAL}/calendars/{_enc(calendar_id)}/events", "items", params=params)
 
 
 @mcp.tool
 async def search_events(query: str, calendar_id: str = "primary",
                         max_results: int = 10) -> list[dict]:
     """Search calendar events by keyword."""
-    c = _client()
-    r = await c.get(f"{GCAL}/calendars/{calendar_id}/events", headers=await _auth(),
-                    params={"q": query, "maxResults": max_results, "singleEvents": True})
-    r.raise_for_status()
-    return r.json().get("items", [])
+    return await _call_list("GET", f"{GCAL}/calendars/{_enc(calendar_id)}/events", "items",
+                            params={"q": query, "maxResults": max_results, "singleEvents": True})
 
 
 @mcp.tool
 async def get_event(event_id: str, calendar_id: str = "primary") -> dict:
     """Get a specific calendar event by ID."""
-    c = _client()
-    r = await c.get(f"{GCAL}/calendars/{calendar_id}/events/{event_id}",
-                    headers=await _auth())
-    r.raise_for_status()
-    return r.json()
+    return await _call_json("GET", f"{GCAL}/calendars/{_enc(calendar_id)}/events/{_enc(event_id)}")
 
 
 # ── OAuth endpoints ────────────────────────────────────────────────────────────
@@ -757,9 +738,19 @@ async def _authorize(req: Request):
         return Response("Unknown redirect_uri", status_code=400)
     if not p.get("code_challenge"):
         return Response("PKCE code_challenge is required", status_code=400)
+    if p.get("code_challenge_method", "S256") != "S256":
+        return Response("Only the S256 code_challenge_method is supported", status_code=400)
 
+    # alias comes from server-side path routing (req.state.alias, set by
+    # _App.__call__ from the actual URL this request came in through) — never from
+    # the client-echoed 'resource' query parameter. A restricted alias must stay
+    # restricted even if an OAuth client fails to echo 'resource' correctly (or
+    # omits it, or a malicious client sends a wrong one) during a restricted-alias
+    # authorization flow — otherwise the resulting Google grant gets full write
+    # scope and the minted JWT gets read_only=False, and that JWT (not which alias
+    # it was created for) is what travels with the token afterward.
+    alias = getattr(req.state, "alias", "")
     resource = p.get("resource")
-    alias = _alias_from_resource(resource)
     read_only = alias in READ_ONLY_ALIASES
     log.info("authorize: alias=%r resource=%r -> %s", alias, resource,
               "read-only" if read_only else "read-write")
@@ -794,8 +785,7 @@ async def _auth_callback(req: Request):
     if not state_data:
         return Response("Invalid or expired state", status_code=400)
 
-    c = _client()
-    r = await c.post("https://oauth2.googleapis.com/token", data={
+    r = await _request_with_retry("POST", "https://oauth2.googleapis.com/token", data={
         "code": req.query_params.get("code"),
         "client_id": GOOGLE_CLIENT_ID,
         "client_secret": GOOGLE_CLIENT_SECRET,
@@ -808,9 +798,10 @@ async def _auth_callback(req: Request):
         log.warning("Google token exchange failed: %s", tokens["error"])
         return Response(f"Token exchange failed: {tokens['error']}", status_code=400)
 
-    c = _client()
-    ui = await c.get("https://www.googleapis.com/oauth2/v3/userinfo",
-                     headers={"Authorization": f"Bearer {tokens['access_token']}"})
+    ui = await _request_with_retry(
+        "GET", "https://www.googleapis.com/oauth2/v3/userinfo",
+        headers={"Authorization": f"Bearer {tokens['access_token']}"},
+    )
     if not ui.is_success:
         log.warning("Google userinfo fetch failed (%s): %s", ui.status_code, ui.text[:200])
         return Response("Failed to fetch Google account info", status_code=502)
@@ -888,7 +879,7 @@ def _www_auth_header(alias: str) -> bytes:
     return (
         f'Bearer realm="Gmail MCP", '
         f'resource_metadata="{BASE_URL}{metadata_path}"'
-    ).encode()
+    ).encode("utf-8", errors="replace")
 
 _OAUTH_PATHS = frozenset([
     "/.well-known/oauth-authorization-server",
@@ -919,6 +910,20 @@ def _with_security_headers(send):
             message = {**message, "headers": headers}
         await send(message)
     return wrapped
+
+
+_MULTI_SLASH = re.compile(r"/+")
+
+
+def _normalize_path(path: str) -> str:
+    """Collapse repeated slashes (e.g. "//mcp" -> "/mcp") before _split_alias sees
+    the path. Without this, a non-canonical path matches neither a known OAuth path
+    nor the /mcp bearer-auth gate's exact-prefix check, so the request would fall
+    through with NO auth check performed at all — relying entirely on whatever the
+    downstream FastMCP/Starlette router does with the same non-canonical path
+    (today it independently 404s rather than treating it as equivalent to /mcp, but
+    that's downstream behavior this file has no control over, not a guarantee)."""
+    return _MULTI_SLASH.sub("/", path)
 
 
 def _split_alias(path: str) -> tuple[str, str]:
@@ -957,6 +962,7 @@ class _App:
                 await self._mcp(scope, receive, send)
             finally:
                 await _http_client.aclose()
+                _http_client = None
             return
 
         if scope["type"] == "http":
@@ -968,7 +974,7 @@ class _App:
             except Exception:
                 log.exception("periodic cleanup failed")
 
-            alias, path = _split_alias(scope["path"])
+            alias, path = _split_alias(_normalize_path(scope["path"]))
             if path != scope["path"]:
                 scope = {**scope, "path": path, "raw_path": path.encode()}
             # Starlette route handlers (e.g. _protected_resource) read this via
@@ -998,7 +1004,6 @@ class _App:
                     await self._send_401(send, alias)
                     return
                 _session_jti.set(payload["jti"])
-                _user_email.set(payload.get("email", ""))
                 _read_only.set(_effective_read_only(payload, alias))
 
             if path in _OAUTH_PATHS:

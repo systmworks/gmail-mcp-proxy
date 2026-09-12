@@ -466,7 +466,110 @@ async def test_modify_labels_does_not_retry_permanent_4xx():
 
 
 @respx.mock
-async def test_modify_labels_retries_on_network_error_then_raises():
+async def test_read_message_retries_transient_5xx_and_recovers():
+    # Regression coverage: read tools (get_profile, read_message, read_thread,
+    # list_drafts, list_labels, list_calendars, list_events, search_events,
+    # get_event) used to go straight through _client(), bypassing the retry
+    # helper entirely — a transient 429/503 failed the call outright with no
+    # recovery, even though GETs are the safest calls to retry (idempotent).
+    route = respx.get(f"{server.GMAIL}/messages/123").mock(side_effect=[
+        httpx.Response(503),
+        httpx.Response(200, json={
+            "id": "123", "threadId": "t123", "snippet": "hi", "labelIds": [],
+            "payload": {"headers": [], "mimeType": "text/plain", "body": {"data": _b64("hi")}},
+        }),
+    ])
+
+    result = await server.read_message("123")
+
+    assert route.call_count == 2
+    assert result["body"] == "hi"
+
+
+@respx.mock
+async def test_get_profile_retries_transient_5xx_and_recovers():
+    route = respx.get(f"{server.GMAIL}/profile").mock(side_effect=[
+        httpx.Response(503),
+        httpx.Response(200, json={"emailAddress": "a@example.com"}),
+    ])
+
+    result = await server.get_profile()
+
+    assert route.call_count == 2
+    assert result == {"emailAddress": "a@example.com"}
+
+
+@respx.mock
+async def test_read_message_url_encodes_message_id():
+    # Regression test: ids were interpolated raw into REST URL path segments with
+    # no encoding. Google's own generated ids are base64url (no "/" by
+    # construction) so this is low-risk for message_id specifically, but the fix
+    # (_enc) is applied uniformly — confirm it actually takes effect here.
+    route = respx.get(f"{server.GMAIL}/messages/a%2Fb").mock(
+        return_value=httpx.Response(200, json={
+            "id": "a/b", "threadId": "t1", "snippet": "", "labelIds": [],
+            "payload": {"headers": [], "mimeType": "text/plain", "body": {"data": _b64("x")}},
+        })
+    )
+
+    result = await server.read_message("a/b")
+
+    assert route.called
+    assert result["id"] == "a/b"
+
+
+@respx.mock
+async def test_get_event_url_encodes_calendar_id():
+    # calendar_id is caller-supplied and can be an arbitrary string (e.g. an email
+    # address used as a calendar id) rather than a Google-generated opaque id.
+    route = respx.get(
+        f"{server.GCAL}/calendars/someone%40example.com/events/evt1"
+    ).mock(return_value=httpx.Response(200, json={"id": "evt1"}))
+
+    result = await server.get_event("evt1", calendar_id="someone@example.com")
+
+    assert route.called
+    assert result == {"id": "evt1"}
+
+
+@respx.mock
+async def test_get_attachment_raises_clear_error_when_data_field_missing():
+    # Regression test (lower-priority cleanup): get_attachment used r2.json()["data"]
+    # (direct key access), which would raise an unhandled KeyError instead of a
+    # clear error if a Gmail attachment response were ever missing 'data'.
+    message_payload = {
+        "payload": {
+            "headers": [],
+            "mimeType": "multipart/mixed",
+            "parts": [
+                {
+                    "partId": "1",
+                    "mimeType": "application/pdf",
+                    "filename": "invoice.pdf",
+                    "body": {"attachmentId": "att1", "size": 10},
+                },
+            ],
+        },
+    }
+    respx.get(f"{server.GMAIL}/messages/123").mock(
+        return_value=httpx.Response(200, json=message_payload)
+    )
+    respx.get(f"{server.GMAIL}/messages/123/attachments/att1").mock(
+        return_value=httpx.Response(200, json={"size": 10})  # no "data" field
+    )
+
+    with pytest.raises(ValueError, match="missing"):
+        await server.get_attachment("123", "1")
+
+
+@respx.mock
+async def test_modify_labels_does_not_retry_network_error():
+    # Regression test: _request_with_retry used to catch httpx.HTTPError (network
+    # errors — timeouts, connection resets, not just HTTP status) and retry
+    # unconditionally. Whether the original POST already landed server-side before
+    # the network error is ambiguous, so blindly retrying a non-idempotent write
+    # (modify_labels here, but also send_email/create_draft/etc.) risked silently
+    # duplicating it. Network errors now propagate on the first attempt instead.
     route = respx.post(f"{server.GMAIL}/messages/msg1/modify").mock(
         side_effect=httpx.ConnectTimeout("boom")
     )
@@ -474,4 +577,4 @@ async def test_modify_labels_retries_on_network_error_then_raises():
     with pytest.raises(httpx.ConnectTimeout):
         await server.modify_labels("msg1", add=["IMPORTANT"])
 
-    assert route.call_count == server.API_RETRY_ATTEMPTS
+    assert route.call_count == 1
