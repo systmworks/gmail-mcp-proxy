@@ -184,6 +184,175 @@ async def test_read_message_falls_back_to_html_when_no_plain_part():
 
 
 @respx.mock
+async def test_read_message_includes_attachment_metadata():
+    payload = {
+        "id": "123", "threadId": "t123", "snippet": "hi", "labelIds": ["INBOX"],
+        "payload": {
+            "headers": [],
+            "mimeType": "multipart/mixed",
+            "parts": [
+                {"mimeType": "text/plain", "body": {"data": _b64("body text")}},
+                {
+                    "mimeType": "application/pdf",
+                    "filename": "invoice.pdf",
+                    "body": {"attachmentId": "att1", "size": 4096},
+                },
+            ],
+        },
+    }
+    respx.get(f"{server.GMAIL}/messages/123").mock(return_value=httpx.Response(200, json=payload))
+
+    result = await server.read_message("123")
+
+    assert result["attachments"] == [
+        {"attachmentId": "att1", "filename": "invoice.pdf", "mimeType": "application/pdf", "size": 4096},
+    ]
+
+
+@respx.mock
+async def test_read_message_attachments_empty_when_none():
+    payload = {
+        "id": "123", "threadId": "t123", "snippet": "hi", "labelIds": ["INBOX"],
+        "payload": {
+            "headers": [],
+            "mimeType": "text/plain",
+            "body": {"data": _b64("just text, no attachments")},
+        },
+    }
+    respx.get(f"{server.GMAIL}/messages/123").mock(return_value=httpx.Response(200, json=payload))
+
+    result = await server.read_message("123")
+
+    assert result["attachments"] == []
+
+
+@respx.mock
+async def test_get_attachment_returns_metadata_and_reencoded_base64():
+    # Raw bytes chosen so the standard-base64 encoding differs from the urlsafe one
+    # (contains "+"/"/"), proving get_attachment actually re-encodes rather than
+    # passing Gmail's base64url straight through.
+    raw = bytes([0xFB, 0xEF, 0xBE, 0xFF, 0x3E, 0x3F])
+    assert "+" in base64.b64encode(raw).decode() or "/" in base64.b64encode(raw).decode()
+    urlsafe_data = base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+    message_payload = {
+        "payload": {
+            "headers": [],
+            "mimeType": "multipart/mixed",
+            "parts": [
+                {
+                    "mimeType": "application/pdf",
+                    "filename": "invoice.pdf",
+                    "body": {"attachmentId": "att1", "size": len(raw)},
+                },
+            ],
+        },
+    }
+    respx.get(f"{server.GMAIL}/messages/123").mock(
+        return_value=httpx.Response(200, json=message_payload)
+    )
+    respx.get(f"{server.GMAIL}/messages/123/attachments/att1").mock(
+        return_value=httpx.Response(200, json={"size": len(raw), "data": urlsafe_data})
+    )
+
+    result = await server.get_attachment("123", "att1")
+
+    assert result["filename"] == "invoice.pdf"
+    assert result["mimeType"] == "application/pdf"
+    assert result["size"] == len(raw)
+    assert base64.b64decode(result["data"]) == raw
+
+
+@respx.mock
+async def test_get_attachment_rejects_oversized_without_downloading():
+    original = server.ATTACHMENT_MAX_BYTES
+    server.ATTACHMENT_MAX_BYTES = 100
+    try:
+        message_payload = {
+            "payload": {
+                "headers": [],
+                "mimeType": "multipart/mixed",
+                "parts": [
+                    {
+                        "mimeType": "application/pdf",
+                        "filename": "big.pdf",
+                        "body": {"attachmentId": "att1", "size": 1000},
+                    },
+                ],
+            },
+        }
+        respx.get(f"{server.GMAIL}/messages/123").mock(
+            return_value=httpx.Response(200, json=message_payload)
+        )
+        # Deliberately not mocking the attachments/{id} route — an unexpected call
+        # to it raises a respx error, proving the bytes were never downloaded.
+
+        with pytest.raises(ValueError, match="exceeds"):
+            await server.get_attachment("123", "att1")
+    finally:
+        server.ATTACHMENT_MAX_BYTES = original
+
+
+@respx.mock
+async def test_get_attachment_raises_when_id_not_found():
+    message_payload = {
+        "payload": {
+            "headers": [],
+            "mimeType": "multipart/mixed",
+            "parts": [
+                {
+                    "mimeType": "application/pdf",
+                    "filename": "invoice.pdf",
+                    "body": {"attachmentId": "att-other", "size": 10},
+                },
+            ],
+        },
+    }
+    respx.get(f"{server.GMAIL}/messages/123").mock(
+        return_value=httpx.Response(200, json=message_payload)
+    )
+
+    with pytest.raises(ValueError, match="no attachment"):
+        await server.get_attachment("123", "att1")
+
+
+@respx.mock
+async def test_get_attachment_rejects_oversized_after_download_if_metadata_size_wrong():
+    original = server.ATTACHMENT_MAX_BYTES
+    server.ATTACHMENT_MAX_BYTES = 10
+    try:
+        raw = b"this is more than ten bytes of data"
+        message_payload = {
+            "payload": {
+                "headers": [],
+                "mimeType": "multipart/mixed",
+                "parts": [
+                    {
+                        "mimeType": "application/pdf",
+                        "filename": "mislabeled.pdf",
+                        # Metadata size understates the real size (e.g. stale/wrong).
+                        "body": {"attachmentId": "att1", "size": 5},
+                    },
+                ],
+            },
+        }
+        respx.get(f"{server.GMAIL}/messages/123").mock(
+            return_value=httpx.Response(200, json=message_payload)
+        )
+        respx.get(f"{server.GMAIL}/messages/123/attachments/att1").mock(
+            return_value=httpx.Response(200, json={
+                "size": len(raw),
+                "data": base64.urlsafe_b64encode(raw).decode().rstrip("="),
+            })
+        )
+
+        with pytest.raises(ValueError, match="exceeds"):
+            await server.get_attachment("123", "att1")
+    finally:
+        server.ATTACHMENT_MAX_BYTES = original
+
+
+@respx.mock
 async def test_delete_draft_handles_204_no_content():
     respx.delete(f"{server.GMAIL}/drafts/abc").mock(return_value=httpx.Response(204))
 

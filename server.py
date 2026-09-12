@@ -51,6 +51,14 @@ SEARCH_ENRICH_LIMIT = max(0, min(200, int(os.environ.get("SEARCH_ENRICH_LIMIT", 
 SEARCH_ENRICH_ATTEMPTS = max(1, min(5, int(os.environ.get("SEARCH_ENRICH_ATTEMPTS", "2"))))
 _ENRICH_RETRY_DELAY = 0.3  # seconds between attempts
 
+# Max attachment size (decoded bytes) get_attachment will fetch/return. Attachment
+# bytes come back as base64 text inside the MCP tool result — i.e. straight into the
+# calling LLM's context, not just over the network — so the default is well below
+# Gmail's own 25MB decoded cap on this endpoint (base64 inflates ~33% and tokenizes
+# poorly). Raise it if you need larger attachments and have the context budget.
+ATTACHMENT_MAX_MB = max(1, min(25, int(os.environ.get("ATTACHMENT_MAX_MB", "3"))))
+ATTACHMENT_MAX_BYTES = ATTACHMENT_MAX_MB * 1024 * 1024
+
 DEFAULT_REDIRECT_URI = "https://claude.ai/api/mcp/auth_callback"
 
 # Redirect URIs /authorize is allowed to send the auth code to. Without this allowlist,
@@ -282,6 +290,23 @@ def _build_email(to: str, subject: str, body: str, cc: str = "",
     return base64.urlsafe_b64encode(msg.as_bytes()).decode()
 
 
+def _find_attachments(part: dict, found: list[dict]) -> None:
+    """Recursively collect attachment metadata (filename/mimeType/size/attachmentId)
+    from a message's MIME part tree. Kept separate from _find_bodies (which only
+    cares about text/plain and text/html)."""
+    filename = part.get("filename")
+    attachment_id = part.get("body", {}).get("attachmentId")
+    if filename and attachment_id:
+        found.append({
+            "attachmentId": attachment_id,
+            "filename": filename,
+            "mimeType": part.get("mimeType", ""),
+            "size": part.get("body", {}).get("size", 0),
+        })
+    for sub in part.get("parts", []):
+        _find_attachments(sub, found)
+
+
 # ── FastMCP tools ──────────────────────────────────────────────────────────────
 
 mcp = FastMCP("Gmail MCP")
@@ -360,7 +385,9 @@ async def search_emails(query: str, max_results: int = 20) -> list[dict]:
 
 @mcp.tool
 async def read_message(message_id: str) -> dict:
-    """Read a Gmail message by ID. Returns headers and decoded body."""
+    """Read a Gmail message by ID. Returns headers, decoded body, and attachment
+    metadata (filename/attachmentId/mimeType/size) — use get_attachment to download
+    an attachment's bytes."""
     c = _client()
     r = await c.get(f"{GMAIL}/messages/{message_id}", headers=await _auth(),
                     params={"format": "full"})
@@ -386,6 +413,9 @@ async def read_message(message_id: str) -> dict:
     _find_bodies(payload, bodies)
     body = bodies.get("text/plain") or bodies.get("text/html", "")
 
+    attachments: list[dict] = []
+    _find_attachments(payload, attachments)
+
     hdrs = {h["name"]: h["value"] for h in payload.get("headers", [])}
     return {
         "id": data["id"],
@@ -397,16 +427,62 @@ async def read_message(message_id: str) -> dict:
         "snippet": data.get("snippet", ""),
         "labels": data.get("labelIds", []),
         "body": body,
+        "attachments": attachments,
     }
 
 
 @mcp.tool
 async def read_thread(thread_id: str) -> dict:
     """Read a full Gmail thread."""
+    # Intentionally a raw passthrough (unlike read_message) — each message's raw
+    # payload already contains attachment parts (filename/body.attachmentId/size)
+    # in its MIME tree; get_attachment works from any message's own "id" here.
     c = _client()
     r = await c.get(f"{GMAIL}/threads/{thread_id}", headers=await _auth())
     r.raise_for_status()
     return r.json()
+
+
+@mcp.tool
+async def get_attachment(message_id: str, attachment_id: str) -> dict:
+    """Download a Gmail attachment's bytes (as standard base64) by message_id and
+    attachment_id from read_message's attachments list. Rejects attachments larger
+    than ATTACHMENT_MAX_MB without downloading them."""
+    c = _client()
+    r = await c.get(f"{GMAIL}/messages/{message_id}", headers=await _auth(),
+                    params={"format": "full"})
+    r.raise_for_status()
+    payload = r.json().get("payload", {})
+
+    found: list[dict] = []
+    _find_attachments(payload, found)
+    meta = next((a for a in found if a["attachmentId"] == attachment_id), None)
+    if meta is None:
+        raise ValueError(f"no attachment {attachment_id!r} found on message {message_id!r}")
+    if meta["size"] > ATTACHMENT_MAX_BYTES:
+        raise ValueError(
+            f"attachment {meta['filename']!r} is {meta['size']} bytes, exceeds "
+            f"ATTACHMENT_MAX_MB ({ATTACHMENT_MAX_MB}MB) limit"
+        )
+
+    r2 = await c.get(f"{GMAIL}/messages/{message_id}/attachments/{attachment_id}",
+                     headers=await _auth())
+    r2.raise_for_status()
+    raw = base64.urlsafe_b64decode(r2.json()["data"] + "==")
+    if len(raw) > ATTACHMENT_MAX_BYTES:
+        raise ValueError(
+            f"attachment {meta['filename']!r} is {len(raw)} bytes, exceeds "
+            f"ATTACHMENT_MAX_MB ({ATTACHMENT_MAX_MB}MB) limit"
+        )
+
+    return {
+        "attachmentId": attachment_id,
+        "messageId": message_id,
+        "filename": meta["filename"],
+        "mimeType": meta["mimeType"],
+        "size": len(raw),
+        "data": base64.b64encode(raw).decode(),
+    }
 
 
 @mcp.tool

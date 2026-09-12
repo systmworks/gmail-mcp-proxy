@@ -23,9 +23,10 @@ The server acts as an OAuth proxy: it presents itself as an OAuth 2.0 authorizat
 | Tool | Description |
 |------|-------------|
 | `get_profile` | Gmail account profile |
-| `search_emails` | Search with Gmail operators (`from:`, `subject:`, `has:attachment`, …). Enriches results up to `SEARCH_ENRICH_LIMIT` — see Configuration below. |
-| `read_message` | Full message with decoded body |
+| `search_emails` | Search with Gmail operators (`from:`, `subject:`, `has:attachment`, …). Enriches results up to `SEARCH_ENRICH_LIMIT` — see Configuration below. Use `has:attachment` in the query to filter to messages with attachments — enrichment itself doesn't include attachment info (see the `SEARCH_ENRICH_LIMIT` row below). |
+| `read_message` | Full message with decoded body and attachment metadata (filename/attachmentId/mimeType/size) |
 | `read_thread` | Full thread |
+| `get_attachment` | Download an attachment's bytes (base64) by `message_id`/`attachment_id` from `read_message`'s `attachments` list — see `ATTACHMENT_MAX_MB` |
 | `send_email` | Send or reply to a thread |
 | `create_draft` | Save a draft |
 | `list_drafts` | List drafts |
@@ -64,9 +65,10 @@ The server acts as an OAuth proxy: it presents itself as an OAuth 2.0 authorizat
 | `ALLOWED_REDIRECT_URIS` | Optional. Comma-separated allowlist of OAuth redirect URIs `/authorize` will accept. Defaults to Claude.ai's callback (`https://claude.ai/api/mcp/auth_callback`) — only change this if you're connecting a non-Claude.ai MCP client. |
 | `LOG_LEVEL` | Optional. Python logging level (`INFO`, `WARNING`, `DEBUG`, etc.). Defaults to `INFO`. |
 | `READ_ONLY_ALIASES` | Optional. Comma-separated list of connector aliases (e.g. `work`) that should be restricted to read-only access — no send, draft, label changes, or trash. See below. |
-| `SEARCH_ENRICH_LIMIT` | Optional. How many `search_emails` results (0–200) get enriched with from/to/subject/date/snippet/labels instead of bare id/threadId. Defaults to `20`. Trades tokens for fewer round-trips: each enriched result costs a few hundred tokens, which pays off when scanning many results at once but is wasted on results never looked at. `read_message` is unaffected either way — it always returns a message's full decoded text body (not attachments), so it's the more expensive call per-message, just not per-search. |
+| `SEARCH_ENRICH_LIMIT` | Optional. How many `search_emails` results (0–200) get enriched with from/to/subject/date/snippet/labels instead of bare id/threadId. Defaults to `20`. Trades tokens for fewer round-trips: each enriched result costs a few hundred tokens, which pays off when scanning many results at once but is wasted on results never looked at. `read_message` is unaffected either way — it always returns a message's full decoded text body and attachment metadata (not attachment bytes — use `get_attachment` for that), so it's the more expensive call per-message, just not per-search. Enrichment itself can't include attachment info even if you raise this — it uses a lighter-weight Gmail fetch that doesn't include the MIME structure attachments live in; use `has:attachment` in the search query instead. |
 | `SEARCH_ENRICH_ATTEMPTS` | Optional. Total attempts (1–5) per message before giving up on enrichment and falling back to bare id/threadId. Defaults to `2`. Raise this if you're seeing a lot of bare results in `search_emails` output — self-hosted networks under the concurrency of a full batch tend to see more transient failures than a Railway/PaaS deployment. |
 | `API_RETRY_ATTEMPTS` | Optional. Total attempts (1–5) for a write-tool call (`send_email`, `modify_labels`, `create_label`, etc.) before giving up. Defaults to `2`. Raise this if a bulk operation (e.g. labelling hundreds of messages) is hitting Gmail's rate limit partway through. |
+| `ATTACHMENT_MAX_MB` | Optional. Max attachment size (1–25MB, decoded) `get_attachment` will fetch. Defaults to `3`. Attachment bytes return as base64 text inside the MCP tool result — straight into the calling LLM's context, not just over the network — so this is set well below Gmail's own 25MB cap on this endpoint. Raise it if you need larger attachments and have the context budget. |
 
 **`search_emails` result fields**
 

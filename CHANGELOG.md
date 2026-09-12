@@ -13,6 +13,40 @@ Releases (no external consumers to serve release notes to), but working mileston
 get a lightweight git tag (`v0.1`, `v0.2`, …) as a rollback anchor. A date heading
 only appears when the date changes from the entry above it.
 
+## 2026-09-12
+
+### 0.29 — Attachment download support
+
+No tool exposed Gmail file attachments — `read_message`'s MIME walker only looked at
+`text/plain`/`text/html` parts, silently skipping attachment parts, so there was no
+way to even learn an attachment existed, let alone fetch its bytes.
+
+**Added**
+- `get_attachment(message_id, attachment_id)` tool — downloads an attachment's bytes,
+  re-encoded as standard base64 (not Gmail's base64url) for portability to a generic
+  MCP client. Looks up filename/mimeType/size from the message's MIME tree first and
+  rejects attachments over `ATTACHMENT_MAX_MB` there, before ever downloading the
+  bytes; re-checks size after decoding as a safety net in case that metadata was
+  missing or wrong. No `_require_write()` gate — this is a read, covered by the
+  existing `gmail.readonly` scope, so it works the same for read-only aliased
+  sessions as `read_message`/`search_emails` do.
+- `ATTACHMENT_MAX_MB` env var (default `3`, clamped 1–25). Attachment bytes return as
+  base64 text inside the MCP tool result — straight into the calling LLM's context,
+  not just over the network — so the default sits well below Gmail's own 25MB decoded
+  cap on this endpoint.
+- `read_message` now also returns an `attachments` list (filename/attachmentId/
+  mimeType/size) via a new shared `_find_attachments` MIME-tree walker, so callers can
+  discover attachment IDs to pass to `get_attachment`.
+- `tests/test_server.py`: coverage for attachment metadata appearing (and staying
+  empty when absent) in `read_message`, successful download with base64 re-encoding,
+  rejecting an oversized attachment without downloading it, rejecting one whose real
+  size exceeds the limit even when metadata understated it, and raising on an unknown
+  attachment ID.
+
+`read_thread` is intentionally left as a raw passthrough — attachment info is already
+present in its raw payload, just nested/undecoded; restructuring its return shape was
+out of scope for this change.
+
 ## 2026-09-09
 
 ### 0.28 — Fix stale Google token used right after a successful refresh
