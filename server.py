@@ -112,6 +112,25 @@ def _google_scopes(read_only: bool) -> str:
 GMAIL = "https://gmail.googleapis.com/gmail/v1/users/me"
 GCAL = "https://www.googleapis.com/calendar/v3"
 
+# Unlike Microsoft Graph's $select (documented to only apply to GET requests —
+# POST/PATCH action endpoints always return the full resource regardless), Google's
+# `fields` system parameter is response-filtering only and applies uniformly across
+# HTTP methods. Applied to every write endpoint that echoes back a Message/Draft —
+# without it, e.g. modify_labels/trash_message/send_email would return the message's
+# full MIME payload (headers, body, attachment parts) on every call, none of which
+# any caller here uses from a write response.
+_COMPACT_MESSAGE_FIELDS = "id,threadId,labelIds"
+_COMPACT_DRAFT_FIELDS = "id,message(id,threadId,labelIds)"
+
+# Same rationale, applied to Calendar's list endpoints: the full Event/CalendarList
+# resource carries a lot a listing tool never uses (conferenceData, extendedProperties,
+# attachments, reminders, source, notificationSettings, ...) on every item, every call.
+# get_event is left unrestricted — a single-item detail fetch is supposed to return
+# everything, same as read_message.
+_EVENT_LIST_FIELDS = ("items(id,summary,description,location,start,end,status,"
+                      "htmlLink,attendees,organizer)")
+_CALENDAR_LIST_FIELDS = "items(id,summary,description,timeZone,primary,accessRole)"
+
 # Outbound Gmail/Calendar API calls retry on these — rate limiting and server
 # errors are usually transient. Other 4xx (403/404, etc.) are permanent.
 _RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
@@ -583,7 +602,8 @@ async def send_email(to: str, subject: str, body: str, cc: str = "",
     payload: dict = {"raw": _build_email(to, subject, body, cc, in_reply_to, references)}
     if thread_id:
         payload["threadId"] = thread_id
-    return await _call_json("POST", f"{GMAIL}/messages/send", json=payload)
+    return await _call_json("POST", f"{GMAIL}/messages/send", json=payload,
+                            params={"fields": _COMPACT_MESSAGE_FIELDS})
 
 
 @mcp.tool
@@ -591,7 +611,8 @@ async def create_draft(to: str, subject: str, body: str, cc: str = "") -> dict:
     """Create a Gmail draft."""
     _require_write()
     return await _call_json("POST", f"{GMAIL}/drafts",
-                            json={"message": {"raw": _build_email(to, subject, body, cc)}})
+                            json={"message": {"raw": _build_email(to, subject, body, cc)}},
+                            params={"fields": _COMPACT_DRAFT_FIELDS})
 
 
 @mcp.tool
@@ -604,7 +625,8 @@ async def list_drafts(max_results: int = 10) -> list[dict]:
 async def send_draft(draft_id: str) -> dict:
     """Send an existing Gmail draft."""
     _require_write()
-    return await _call_json("POST", f"{GMAIL}/drafts/send", json={"id": draft_id})
+    return await _call_json("POST", f"{GMAIL}/drafts/send", json={"id": draft_id},
+                            params={"fields": _COMPACT_MESSAGE_FIELDS})
 
 
 @mcp.tool
@@ -613,7 +635,8 @@ async def update_draft(draft_id: str, to: str, subject: str, body: str,
     """Replace the content of an existing Gmail draft."""
     _require_write()
     return await _call_json("PUT", f"{GMAIL}/drafts/{_enc(draft_id)}",
-                            json={"message": {"raw": _build_email(to, subject, body, cc)}})
+                            json={"message": {"raw": _build_email(to, subject, body, cc)}},
+                            params={"fields": _COMPACT_DRAFT_FIELDS})
 
 
 @mcp.tool
@@ -669,7 +692,8 @@ async def modify_labels(message_id: str, add: list[str] | None = None,
     """Add or remove labels on a Gmail message."""
     _require_write()
     return await _call_json("POST", f"{GMAIL}/messages/{_enc(message_id)}/modify",
-                            json={"addLabelIds": add or [], "removeLabelIds": remove or []})
+                            json={"addLabelIds": add or [], "removeLabelIds": remove or []},
+                            params={"fields": _COMPACT_MESSAGE_FIELDS})
 
 
 @mcp.tool
@@ -677,27 +701,31 @@ async def report_phishing(message_id: str) -> dict:
     """Mark a Gmail message as spam."""
     _require_write()
     return await _call_json("POST", f"{GMAIL}/messages/{_enc(message_id)}/modify",
-                            json={"addLabelIds": ["SPAM"], "removeLabelIds": ["INBOX"]})
+                            json={"addLabelIds": ["SPAM"], "removeLabelIds": ["INBOX"]},
+                            params={"fields": _COMPACT_MESSAGE_FIELDS})
 
 
 @mcp.tool
 async def trash_message(message_id: str) -> dict:
     """Move a Gmail message to trash."""
     _require_write()
-    return await _call_json("POST", f"{GMAIL}/messages/{_enc(message_id)}/trash")
+    return await _call_json("POST", f"{GMAIL}/messages/{_enc(message_id)}/trash",
+                            params={"fields": _COMPACT_MESSAGE_FIELDS})
 
 
 @mcp.tool
 async def list_calendars() -> list[dict]:
     """List all Google Calendars."""
-    return await _call_list("GET", f"{GCAL}/users/me/calendarList", key="items")
+    return await _call_list("GET", f"{GCAL}/users/me/calendarList", key="items",
+                            params={"fields": _CALENDAR_LIST_FIELDS})
 
 
 @mcp.tool
 async def list_events(calendar_id: str = "primary", time_min: str = "",
                       time_max: str = "", max_results: int = 20) -> list[dict]:
     """List calendar events. time_min/time_max in RFC3339 (e.g. 2026-05-20T00:00:00Z)."""
-    params: dict = {"maxResults": max_results, "singleEvents": True, "orderBy": "startTime"}
+    params: dict = {"maxResults": max_results, "singleEvents": True, "orderBy": "startTime",
+                    "fields": _EVENT_LIST_FIELDS}
     if time_min:
         params["timeMin"] = time_min
     if time_max:
@@ -710,7 +738,8 @@ async def search_events(query: str, calendar_id: str = "primary",
                         max_results: int = 10) -> list[dict]:
     """Search calendar events by keyword."""
     return await _call_list("GET", f"{GCAL}/calendars/{_enc(calendar_id)}/events", key="items",
-                            params={"q": query, "maxResults": max_results, "singleEvents": True})
+                            params={"q": query, "maxResults": max_results, "singleEvents": True,
+                                    "fields": _EVENT_LIST_FIELDS})
 
 
 @mcp.tool

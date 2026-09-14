@@ -604,6 +604,102 @@ async def test_read_message_retries_network_error_and_recovers():
 
 
 @respx.mock
+async def test_trash_message_requests_compact_fields():
+    # Ported concern from sibling project outlook-mcp-proxy: its Graph API ignores
+    # $select on POST/action endpoints, so move/trash calls always echoed back the
+    # full message body. Gmail's `fields` system parameter (unlike Graph's $select)
+    # does filter write-endpoint responses too — assert it's actually requested, so
+    # trash/modify/draft calls don't pull a full MIME payload into context for
+    # nothing.
+    route = respx.post(f"{server.GMAIL}/messages/msg1/trash",
+                       params={"fields": server._COMPACT_MESSAGE_FIELDS}).mock(
+        return_value=httpx.Response(200, json={"id": "msg1", "threadId": "t1", "labelIds": ["TRASH"]})
+    )
+
+    result = await server.trash_message("msg1")
+
+    assert route.called
+    assert result == {"id": "msg1", "threadId": "t1", "labelIds": ["TRASH"]}
+
+
+@respx.mock
+async def test_modify_labels_requests_compact_fields():
+    route = respx.post(f"{server.GMAIL}/messages/msg1/modify",
+                       params={"fields": server._COMPACT_MESSAGE_FIELDS}).mock(
+        return_value=httpx.Response(200, json={"id": "msg1", "labelIds": ["IMPORTANT"]})
+    )
+
+    await server.modify_labels("msg1", add=["IMPORTANT"])
+
+    assert route.called
+
+
+@respx.mock
+async def test_create_draft_requests_compact_fields():
+    route = respx.post(f"{server.GMAIL}/drafts",
+                       params={"fields": server._COMPACT_DRAFT_FIELDS}).mock(
+        return_value=httpx.Response(200, json={"id": "d1", "message": {"id": "m1", "threadId": "t1"}})
+    )
+
+    await server.create_draft("to@example.com", "subj", "body")
+
+    assert route.called
+
+
+@respx.mock
+async def test_send_email_requests_compact_fields():
+    route = respx.post(f"{server.GMAIL}/messages/send",
+                       params={"fields": server._COMPACT_MESSAGE_FIELDS}).mock(
+        return_value=httpx.Response(200, json={"id": "m1", "threadId": "t1", "labelIds": ["SENT"]})
+    )
+
+    await server.send_email("to@example.com", "subj", "body")
+
+    assert route.called
+
+
+@respx.mock
+async def test_list_calendars_requests_compact_fields():
+    # Calendar's CalendarList/Event resources carry a lot a listing tool never uses
+    # (conferenceData, extendedProperties, attachments, notificationSettings, ...) —
+    # assert the trimmed `fields` param is actually sent, not just defined.
+    route = respx.get(f"{server.GCAL}/users/me/calendarList",
+                      params={"fields": server._CALENDAR_LIST_FIELDS}).mock(
+        return_value=httpx.Response(200, json={"items": [{"id": "primary", "summary": "Me"}]})
+    )
+
+    result = await server.list_calendars()
+
+    assert route.called
+    assert result == [{"id": "primary", "summary": "Me"}]
+
+
+@respx.mock
+async def test_list_events_requests_compact_fields():
+    route = respx.get(f"{server.GCAL}/calendars/primary/events",
+                      params={"fields": server._EVENT_LIST_FIELDS}).mock(
+        return_value=httpx.Response(200, json={"items": [{"id": "evt1", "summary": "Standup"}]})
+    )
+
+    result = await server.list_events()
+
+    assert route.called
+    assert result == [{"id": "evt1", "summary": "Standup"}]
+
+
+@respx.mock
+async def test_search_events_requests_compact_fields():
+    route = respx.get(f"{server.GCAL}/calendars/primary/events",
+                      params={"fields": server._EVENT_LIST_FIELDS}).mock(
+        return_value=httpx.Response(200, json={"items": []})
+    )
+
+    await server.search_events("standup")
+
+    assert route.called
+
+
+@respx.mock
 async def test_read_message_raises_after_exhausting_network_error_retries():
     route = respx.get(f"{server.GMAIL}/messages/123").mock(
         side_effect=httpx.ConnectTimeout("boom")

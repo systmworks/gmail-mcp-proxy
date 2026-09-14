@@ -14,6 +14,66 @@ entry gets a matching annotated git tag (`v0.1`, `v0.2`, …) as a rollback anch
 created at push time, pointing at the commit that introduced it. A date heading
 only appears when the date changes from the entry above it.
 
+## 2026-09-14
+
+### 0.42 — Trim over-fetched Calendar list responses
+
+A follow-up audit ("does any tool pull down more than it needs?") after 0.41 found
+`list_calendars`/`list_events`/`search_events` requested no `fields` param at all —
+each Event/CalendarList item came back with everything the Calendar API carries
+(`conferenceData`, `extendedProperties`, `attachments`, `reminders`, `source`,
+`notificationSettings`, etc.), unused by a listing tool, on every item, every call.
+
+**Fixed**
+- `list_calendars` now requests `fields=items(id,summary,description,timeZone,
+  primary,accessRole)` (`_CALENDAR_LIST_FIELDS`).
+- `list_events`, `search_events` now request `fields=items(id,summary,description,
+  location,start,end,status,htmlLink,attendees,organizer)` (`_EVENT_LIST_FIELDS`).
+- `get_event` deliberately left unrestricted — a single-item detail fetch is meant
+  to return everything, same as `read_message`.
+- `tests/test_server.py`: coverage that all three actually send the trimmed
+  `fields` param.
+
+`get_attachment` was also flagged in the same audit (its `format=full` message fetch
+pulls the full decoded text/HTML body just to locate one attachment part by
+`partId`) but left unfixed — Gmail's MIME `parts` tree nests arbitrarily deep and
+Google's partial-response `fields` syntax isn't truly recursive, so a fixed-depth
+mask risks silently missing attachments on deeply-nested/forwarded messages. Needs
+live verification of real-world nesting depth before trusting a fix there.
+
+### 0.41 — Trim write-tool responses to avoid pulling a full message body into context
+
+Prompted by checking sibling project outlook-mcp-proxy's changelog for fixes worth
+porting: its 0.13 found that Microsoft Graph's `$select` is documented to only apply
+to GET requests — POST/PATCH/action endpoints there always echo back the complete
+resource, full HTML body included, no matter what query params are sent — and fixed
+it by trimming those responses in Python after the fact. Checked whether the same
+root cause applies to Gmail: it doesn't. Google's `fields` system parameter is a
+response-filtering FieldMask, not GET-specific, so unlike Graph's `$select` it does
+work on write/action endpoints too — meaning the fix here is to actually ask Gmail
+for less, rather than trim an unavoidably-full response in Python afterward.
+
+**Fixed**
+- `send_email`, `modify_labels`, `report_phishing`, `trash_message`, `send_draft` —
+  each hits an endpoint that echoes back the affected Message resource (full MIME
+  payload: headers, body, attachment parts) unless told otherwise. Now request
+  `fields=id,threadId,labelIds` (`_COMPACT_MESSAGE_FIELDS`) so Gmail itself never
+  serializes the body in the first place, rather than fetching and discarding it.
+- `create_draft`, `update_draft` — same concern for the Draft resource's embedded
+  `message`; now request `fields=id,message(id,threadId,labelIds)`
+  (`_COMPACT_DRAFT_FIELDS`).
+- `list_drafts`, `list_labels`, `list_calendars` were checked against the same
+  concern and found already minimal by API design (undocumented but verified via
+  this project's existing test mocks and Gmail API reference: `drafts.list`'s
+  embedded message stub carries only `id`/`threadId`, `labels.list` only
+  `id`/`name`/`type` — neither includes a message body) — no change needed.
+  Similarly, Outlook's 0.9-0.12 (folder-pagination `nextLink` following, a
+  folder-scoped `list_messages` tool) don't have an analog here: this project has no
+  hand-rolled recursive-listing loop, and label-scoped search already covers
+  `search_emails(query="label:X")`.
+- `tests/test_server.py`: coverage that `trash_message`, `modify_labels`,
+  `create_draft`, and `send_email` actually send the compact `fields` param.
+
 ## 2026-09-13
 
 ### 0.40 — Retry network errors for idempotent (GET/HEAD) calls too
