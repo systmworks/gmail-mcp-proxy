@@ -33,6 +33,10 @@ logging.basicConfig(
 )
 log = logging.getLogger("gmail_mcp")
 
+# Keep in step with the newest CHANGELOG.md entry. Logged at startup and reported to
+# MCP clients, so a deployed container's version can be confirmed.
+VERSION = "0.44"
+
 # ── Config ─────────────────────────────────────────────────────────────────────
 
 GOOGLE_CLIENT_ID = os.environ["GOOGLE_CLIENT_ID"]
@@ -400,7 +404,7 @@ def _find_part_by_id(part: dict, part_id: str) -> dict | None:
 
 # ── FastMCP tools ──────────────────────────────────────────────────────────────
 
-mcp = FastMCP("Gmail MCP")
+mcp = FastMCP("Gmail MCP", version=VERSION)
 
 
 async def _call(method: str, url: str, **kwargs: Any) -> httpx.Response:
@@ -433,8 +437,19 @@ async def _call_delete(method: str, url: str, deleted_id: str, **kwargs: Any) ->
 
 @mcp.tool
 async def get_profile() -> dict:
-    """Get the authenticated Gmail account's profile."""
-    return await _call_json("GET", f"{GMAIL}/profile")
+    """Get the authenticated Gmail account's profile, plus serverVersion (the
+    running proxy's version) so a client can tell whether its cached tool list is
+    out of date after an upgrade."""
+    return {**await _call_json("GET", f"{GMAIL}/profile"), "serverVersion": VERSION}
+
+
+@mcp.tool
+async def get_version() -> dict:
+    """Report the running proxy's version (same value as get_profile's
+    serverVersion and the startup log line). If it is newer than what a tool's
+    description or parameters suggest, the client's cached tool list is stale -
+    remove and re-add the connector."""
+    return {"version": VERSION}
 
 
 @mcp.tool
@@ -1022,6 +1037,7 @@ class _App:
     async def __call__(self, scope, receive, send):
         if scope["type"] == "lifespan":
             global _http_client
+            log.info("Gmail MCP proxy v%s starting", VERSION)
             _http_client = httpx.AsyncClient(timeout=HTTPX_TIMEOUT)
             try:
                 await self._mcp(scope, receive, send)

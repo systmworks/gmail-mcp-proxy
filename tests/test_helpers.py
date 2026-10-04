@@ -139,3 +139,10 @@ def test_effective_read_only_false_for_unrestricted_alias():
         assert server._effective_read_only({"read_only": False}, "personal") is False
     finally:
         server.READ_ONLY_ALIASES = original
+
+
+def test_changelog_top_entry_matches_server_version():
+    import pathlib
+    text = (pathlib.Path(__file__).parent.parent / "CHANGELOG.md").read_text(encoding="utf-8")
+    first_entry = next(line for line in text.splitlines() if line.startswith("### "))
+    assert first_entry.startswith(f"### {server.VERSION} ")

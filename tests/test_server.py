@@ -525,7 +525,11 @@ async def test_get_profile_retries_transient_5xx_and_recovers():
     result = await server.get_profile()
 
     assert route.call_count == 2
-    assert result == {"emailAddress": "a@example.com"}
+    assert result == {"emailAddress": "a@example.com", "serverVersion": server.VERSION}
+
+
+async def test_get_version_reports_server_version():
+    assert await server.get_version() == {"version": server.VERSION}
 
 
 @respx.mock

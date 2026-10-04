@@ -16,6 +16,19 @@ only appears when the date changes from the entry above it.
 
 ## 2026-10-04
 
+### 0.44 - Report the running proxy version
+
+After a redeploy, an AI agent had no way to confirm which proxy version it was talking
+to, or whether its cached tool list was stale. Matches the Outlook proxy's approach.
+
+**Added**
+- `VERSION` constant, kept in step with the newest CHANGELOG entry and passed to
+  `FastMCP(..., version=VERSION)` so it also appears in the MCP server info.
+- `get_version` tool returning `{"version": VERSION}`.
+- `get_profile` now also returns `serverVersion`.
+- Startup log line `Gmail MCP proxy v<version> starting`.
+- `tests/test_helpers.py`: guard that the top CHANGELOG entry matches `VERSION`.
+
 ### 0.43 - Add batch_modify_labels for bulk relabelling
 
 Relabelling a mailbox one message at a time through `modify_labels` took one tool call
