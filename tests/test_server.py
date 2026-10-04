@@ -1,4 +1,5 @@
 import base64
+import json
 import time
 
 import httpx
@@ -205,7 +206,7 @@ async def test_read_message_includes_attachment_metadata():
 
     result = await server.read_message("123")
 
-    # Both extracted from the same single tree walk (_find_bodies_and_attachments) —
+    # Both extracted from the same single tree walk (_find_bodies_and_attachments) -
     # confirms merging what used to be two separate passes didn't drop either.
     assert result["body"] == "body text"
     assert result["attachments"] == [
@@ -271,7 +272,7 @@ async def test_get_attachment_returns_metadata_and_reencoded_base64():
 @respx.mock
 async def test_get_attachment_resolves_fresh_attachment_id_each_call():
     # Regression test: Gmail's attachmentId has been observed in production to
-    # differ across separate messages.get calls for the very same message/part —
+    # differ across separate messages.get calls for the very same message/part -
     # only partId is documented immutable. get_attachment must resolve
     # attachmentId fresh from its own fetch rather than trusting one a caller
     # cached from an earlier read_message call.
@@ -335,7 +336,7 @@ async def test_get_attachment_rejects_oversized_without_downloading():
         respx.get(f"{server.GMAIL}/messages/123").mock(
             return_value=httpx.Response(200, json=message_payload)
         )
-        # Deliberately not mocking the attachments/{id} route — an unexpected call
+        # Deliberately not mocking the attachments/{id} route - an unexpected call
         # to it raises a respx error, proving the bytes were never downloaded.
 
         with pytest.raises(ValueError, match="exceeds"):
@@ -430,6 +431,31 @@ async def test_write_tools_reject_read_only_sessions():
 
 
 @respx.mock
+async def test_batch_modify_labels_sends_ids_and_reports_count():
+    route = respx.post(f"{server.GMAIL}/messages/batchModify").mock(
+        return_value=httpx.Response(204)
+    )
+
+    result = await server.batch_modify_labels(["m1", "m2"], add=["Label_5"], remove=["INBOX"])
+
+    assert result == {"modified": 2}
+    assert json.loads(route.calls.last.request.content) == {
+        "ids": ["m1", "m2"], "addLabelIds": ["Label_5"], "removeLabelIds": ["INBOX"]}
+
+
+@pytest.mark.parametrize("count", [0, server.BATCH_MODIFY_MAX + 1])
+async def test_batch_modify_labels_rejects_out_of_range_id_counts(count):
+    with pytest.raises(ValueError):
+        await server.batch_modify_labels([f"m{i}" for i in range(count)], add=["Label_5"])
+
+
+async def test_batch_modify_labels_rejects_read_only_sessions():
+    server._read_only.set(True)
+    with pytest.raises(PermissionError):
+        await server.batch_modify_labels(["m1"], add=["Label_5"])
+
+
+@respx.mock
 async def test_modify_labels_retries_and_recovers_from_transient_5xx():
     # Regression coverage for API_RETRY_ATTEMPTS: bulk label operations otherwise
     # fail outright the moment Gmail rate-limits a single call.
@@ -473,7 +499,7 @@ async def test_read_message_retries_transient_5xx_and_recovers():
     # Regression coverage: read tools (get_profile, read_message, read_thread,
     # list_drafts, list_labels, list_calendars, list_events, search_events,
     # get_event) used to go straight through _client(), bypassing the retry
-    # helper entirely — a transient 429/503 failed the call outright with no
+    # helper entirely - a transient 429/503 failed the call outright with no
     # recovery, even though GETs are the safest calls to retry (idempotent).
     route = respx.get(f"{server.GMAIL}/messages/123").mock(side_effect=[
         httpx.Response(503),
@@ -507,7 +533,7 @@ async def test_read_message_url_encodes_message_id():
     # Regression test: ids were interpolated raw into REST URL path segments with
     # no encoding. Google's own generated ids are base64url (no "/" by
     # construction) so this is low-risk for message_id specifically, but the fix
-    # (_enc) is applied uniformly — confirm it actually takes effect here.
+    # (_enc) is applied uniformly - confirm it actually takes effect here.
     route = respx.get(f"{server.GMAIL}/messages/a%2Fb").mock(
         return_value=httpx.Response(200, json={
             "id": "a/b", "threadId": "t1", "snippet": "", "labelIds": [],
@@ -568,7 +594,7 @@ async def test_get_attachment_raises_clear_error_when_data_field_missing():
 @respx.mock
 async def test_modify_labels_does_not_retry_network_error():
     # Regression test: _request_with_retry used to catch httpx.HTTPError (network
-    # errors — timeouts, connection resets, not just HTTP status) and retry
+    # errors - timeouts, connection resets, not just HTTP status) and retry
     # unconditionally. Whether the original POST already landed server-side before
     # the network error is ambiguous, so blindly retrying a non-idempotent write
     # (modify_labels here, but also send_email/create_draft/etc.) risked silently
@@ -586,7 +612,7 @@ async def test_modify_labels_does_not_retry_network_error():
 @respx.mock
 async def test_read_message_retries_network_error_and_recovers():
     # GET/HEAD are safe to retry even on a network-level error (unlike the write
-    # case above) — retrying can't duplicate an effect. _request_with_retry derives
+    # case above) - retrying can't duplicate an effect. _request_with_retry derives
     # this from the HTTP method itself (_IDEMPOTENT_METHODS), so no call site needs
     # to opt in explicitly.
     route = respx.get(f"{server.GMAIL}/messages/123").mock(side_effect=[
@@ -608,7 +634,7 @@ async def test_trash_message_requests_compact_fields():
     # Ported concern from sibling project outlook-mcp-proxy: its Graph API ignores
     # $select on POST/action endpoints, so move/trash calls always echoed back the
     # full message body. Gmail's `fields` system parameter (unlike Graph's $select)
-    # does filter write-endpoint responses too — assert it's actually requested, so
+    # does filter write-endpoint responses too - assert it's actually requested, so
     # trash/modify/draft calls don't pull a full MIME payload into context for
     # nothing.
     route = respx.post(f"{server.GMAIL}/messages/msg1/trash",
@@ -661,7 +687,7 @@ async def test_send_email_requests_compact_fields():
 @respx.mock
 async def test_list_calendars_requests_compact_fields():
     # Calendar's CalendarList/Event resources carry a lot a listing tool never uses
-    # (conferenceData, extendedProperties, attachments, notificationSettings, ...) —
+    # (conferenceData, extendedProperties, attachments, notificationSettings, ...) -
     # assert the trimmed `fields` param is actually sent, not just defined.
     route = respx.get(f"{server.GCAL}/users/me/calendarList",
                       params={"fields": server._CALENDAR_LIST_FIELDS}).mock(

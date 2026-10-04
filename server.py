@@ -1,5 +1,5 @@
 """
-Gmail MCP Server — FastMCP + Google OAuth proxy
+Gmail MCP Server - FastMCP + Google OAuth proxy
 
 Flow:
   Claude.ai ──[OAuth]──► This server ──[OAuth]──► Google
@@ -42,7 +42,7 @@ JWT_SECRET = os.environ["JWT_SECRET"]
 
 HTTPX_TIMEOUT = 30.0
 STATE_TTL = 600  # seconds; abandoned OAuth flows are purged after this
-# Max search_emails results to fetch metadata for per call. User-configurable —
+# Max search_emails results to fetch metadata for per call. User-configurable -
 # direct token-cost/usefulness trade-off, see README. Clamped so a bad env value
 # can't silently disable enrichment or blow past Gmail's quota.
 SEARCH_ENRICH_LIMIT = max(0, min(200, int(os.environ.get("SEARCH_ENRICH_LIMIT", "20"))))
@@ -53,8 +53,8 @@ SEARCH_ENRICH_ATTEMPTS = max(1, min(5, int(os.environ.get("SEARCH_ENRICH_ATTEMPT
 _ENRICH_RETRY_DELAY = 0.3  # seconds between attempts
 
 # Max attachment size (decoded bytes) get_attachment will fetch/return. Attachment
-# bytes come back as base64 text inside the MCP tool result — i.e. straight into the
-# calling LLM's context, not just over the network — so the default is well below
+# bytes come back as base64 text inside the MCP tool result - i.e. straight into the
+# calling LLM's context, not just over the network - so the default is well below
 # Gmail's own 25MB decoded cap on this endpoint (base64 inflates ~33% and tokenizes
 # poorly). Raise it if you need larger attachments and have the context budget.
 ATTACHMENT_MAX_MB = max(1, min(25, int(os.environ.get("ATTACHMENT_MAX_MB", "3"))))
@@ -65,7 +65,7 @@ DEFAULT_REDIRECT_URI = "https://claude.ai/api/mcp/auth_callback"
 # Redirect URIs /authorize is allowed to send the auth code to. Without this allowlist,
 # an attacker can craft an /authorize?redirect_uri=<attacker-controlled> link and, once
 # the victim completes Google's consent screen, receive the resulting single-use code
-# themselves — full account takeover if PKCE isn't also enforced (see _authorize below).
+# themselves - full account takeover if PKCE isn't also enforced (see _authorize below).
 ALLOWED_REDIRECT_URIS = frozenset(
     u.strip() for u in os.environ.get(
         "ALLOWED_REDIRECT_URIS", DEFAULT_REDIRECT_URI
@@ -75,7 +75,7 @@ ALLOWED_REDIRECT_URIS = frozenset(
 def _parse_read_only_aliases(value: str) -> frozenset[str]:
     """Split a comma-separated READ_ONLY_ALIASES value into a set of bare alias
     names. Filters on the *final* stripped value (walrus operator) rather than on
-    an intermediate one — a naive `a.strip().strip("/") for a in ... if a.strip()`
+    an intermediate one - a naive `a.strip().strip("/") for a in ... if a.strip()`
     can pass its own filter on a slash-only token (e.g. a stray "/") whose
     whitespace-only strip is truthy, then collapse to "" once slashes are also
     stripped, silently inserting the empty string (the *unaliased* connector's own
@@ -87,7 +87,7 @@ def _parse_read_only_aliases(value: str) -> frozenset[str]:
 
 
 # Aliased connectors (e.g. /work/mcp) named here get Google scopes covering only
-# read access — see _google_scopes() below.
+# read access - see _google_scopes() below.
 READ_ONLY_ALIASES = _parse_read_only_aliases(os.environ.get("READ_ONLY_ALIASES", ""))
 
 GOOGLE_SCOPES_BASE = [
@@ -112,32 +112,33 @@ def _google_scopes(read_only: bool) -> str:
 GMAIL = "https://gmail.googleapis.com/gmail/v1/users/me"
 GCAL = "https://www.googleapis.com/calendar/v3"
 
-# Unlike Microsoft Graph's $select (documented to only apply to GET requests —
+# Unlike Microsoft Graph's $select (documented to only apply to GET requests -
 # POST/PATCH action endpoints always return the full resource regardless), Google's
 # `fields` system parameter is response-filtering only and applies uniformly across
-# HTTP methods. Applied to every write endpoint that echoes back a Message/Draft —
+# HTTP methods. Applied to every write endpoint that echoes back a Message/Draft -
 # without it, e.g. modify_labels/trash_message/send_email would return the message's
 # full MIME payload (headers, body, attachment parts) on every call, none of which
 # any caller here uses from a write response.
 _COMPACT_MESSAGE_FIELDS = "id,threadId,labelIds"
+BATCH_MODIFY_MAX = 1000  # Gmail's own per-call cap for messages.batchModify
 _COMPACT_DRAFT_FIELDS = "id,message(id,threadId,labelIds)"
 
 # Same rationale, applied to Calendar's list endpoints: the full Event/CalendarList
 # resource carries a lot a listing tool never uses (conferenceData, extendedProperties,
 # attachments, reminders, source, notificationSettings, ...) on every item, every call.
-# get_event is left unrestricted — a single-item detail fetch is supposed to return
+# get_event is left unrestricted - a single-item detail fetch is supposed to return
 # everything, same as read_message.
 _EVENT_LIST_FIELDS = ("items(id,summary,description,location,start,end,status,"
                       "htmlLink,attendees,organizer)")
 _CALENDAR_LIST_FIELDS = "items(id,summary,description,timeZone,primary,accessRole)"
 
-# Outbound Gmail/Calendar API calls retry on these — rate limiting and server
+# Outbound Gmail/Calendar API calls retry on these - rate limiting and server
 # errors are usually transient. Other 4xx (403/404, etc.) are permanent.
 _RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
 
 # HTTP methods safe to retry even on a network-level error (timeout, connection
 # reset) rather than just a definite HTTP status. GET/HEAD are defined by HTTP
-# itself as safe/idempotent — retrying one can't duplicate an effect. POST/PUT/
+# itself as safe/idempotent - retrying one can't duplicate an effect. POST/PUT/
 # PATCH/DELETE are not: whether the original request already landed server-side
 # before a network error is ambiguous, so retrying one of those risks silently
 # duplicating it (e.g. sending the same email twice). See _request_with_retry.
@@ -152,14 +153,14 @@ API_RETRY_ATTEMPTS = max(1, min(5, int(os.environ.get("API_RETRY_ATTEMPTS", "2")
 _API_RETRY_DELAY = 0.3  # seconds between attempts
 
 # Shared connection-pooled client for all outbound Gmail/Calendar/Google OAuth requests.
-# Created/closed around the ASGI lifespan in _App.__call__ — avoids paying a fresh
+# Created/closed around the ASGI lifespan in _App.__call__ - avoids paying a fresh
 # TCP+TLS handshake to googleapis.com on every single tool call.
 _http_client: httpx.AsyncClient | None = None
 
 
 def _client() -> httpx.AsyncClient:
     if _http_client is None:
-        raise RuntimeError("HTTP client not initialized — server lifespan hasn't started")
+        raise RuntimeError("HTTP client not initialized - server lifespan hasn't started")
     return _http_client
 
 
@@ -187,7 +188,7 @@ def _enc(value: str) -> str:
     (never into a JSON request body field, where it doesn't apply). Google's own
     generated ids are base64url (no "/" by construction) so this rarely bites in
     practice, but calendar_id in particular can be an arbitrary caller-supplied
-    string (e.g. an email address used as a calendar id) — encode unconditionally
+    string (e.g. an email address used as a calendar id) - encode unconditionally
     rather than relying on how unlikely a literal "/" is today."""
     return quote(str(value), safe="")
 
@@ -211,7 +212,7 @@ def _purge_expired_states() -> None:
 def _purge_expired_tokens() -> None:
     # Runs on every incoming HTTP request (not just ones for the session being
     # purged), so a session's jwt_exp elapsing while _refresh() is mid-flight for
-    # that same session — awaiting Google's response — could otherwise have this
+    # that same session - awaiting Google's response - could otherwise have this
     # pop the entry out from under it: _refresh then writes the new token into a
     # dict no longer referenced by _token_store, silently losing the session
     # despite _refresh reporting success. Skip a session whose refresh lock is
@@ -274,7 +275,7 @@ async def _google_access_token(jti: str) -> str:
 
 async def _auth() -> dict:
     # Resolves the token from _token_store at the moment of use rather than trusting
-    # a value captured earlier in _App.__call__ — self-hosted (non-Railway) traffic
+    # a value captured earlier in _App.__call__ - self-hosted (non-Railway) traffic
     # showed a refreshed token sometimes never reaching the task that actually makes
     # the Gmail call, so a token good for another hour got used to build a header
     # for a task still holding an expired one from before the refresh.
@@ -286,18 +287,18 @@ async def _auth() -> dict:
 
 
 async def _request_with_retry(method: str, url: str, **kwargs: Any) -> httpx.Response:
-    """API call with retry — up to API_RETRY_ATTEMPTS total tries on a definite
+    """API call with retry - up to API_RETRY_ATTEMPTS total tries on a definite
     retryable HTTP status (429, 5xx) before giving up. Callers keep calling
     r.raise_for_status() as before: a final retryable-status response is returned
     as-is (so that still raises).
 
     Network-level errors (timeouts, connection resets) are only retried for
-    GET/HEAD (_IDEMPOTENT_METHODS) — methods HTTP itself defines as safe to repeat.
+    GET/HEAD (_IDEMPOTENT_METHODS) - methods HTTP itself defines as safe to repeat.
     For everything else (POST/PUT/PATCH/DELETE), whether the original request
     already landed server-side before the network error is ambiguous, so a network
     error propagates immediately instead: blindly retrying a non-idempotent write
     (send_email, create_draft, etc.) risks silently duplicating it. This falls out
-    of `method`, already required at every call site — no extra parameter for
+    of `method`, already required at every call site - no extra parameter for
     callers to get backwards."""
     c = _client()
     r: httpx.Response | None = None
@@ -324,10 +325,10 @@ def _require_write() -> None:
 
 def _effective_read_only(payload: dict, alias: str) -> bool:
     """A restricted alias stays restricted even if the JWT itself says
-    read_only=False — e.g. because READ_ONLY_ALIASES was edited to add this alias
+    read_only=False - e.g. because READ_ONLY_ALIASES was edited to add this alias
     *after* the JWT was already minted. JWTs are immutable for their 30-day life, so
     without this re-check, a config change would only take effect for brand-new
-    logins — existing sessions would keep read/write access until their token
+    logins - existing sessions would keep read/write access until their token
     happened to expire. `alias` here comes from server-side path routing
     (_split_alias) on the *current* request, not anything the client asserts, so
     this can't be bypassed by client behavior either."""
@@ -352,7 +353,7 @@ def _find_bodies_and_attachments(part: dict, bodies: dict[str, str],
                                  attachments: list[dict]) -> None:
     """Single recursive pass over a message's MIME part tree collecting both decoded
     text bodies (text/plain and text/html) and attachment metadata (filename/
-    mimeType/size/partId) — one walk instead of two separate ones over the same
+    mimeType/size/partId) - one walk instead of two separate ones over the same
     tree. Unlike a body-only walker, this can't early-exit once both body types are
     found: attachments can appear anywhere in the tree and all of them must be
     collected regardless.
@@ -404,9 +405,9 @@ mcp = FastMCP("Gmail MCP")
 
 async def _call(method: str, url: str, **kwargs: Any) -> httpx.Response:
     """Shared auth + retry + raise-for-status boilerplate for every Gmail/Calendar
-    API call, read or write alike — both go through the same _request_with_retry
+    API call, read or write alike - both go through the same _request_with_retry
     (see its own docstring for exactly what it does and doesn't retry). Always
-    injects the auth header itself — callers must not pass their own `headers`
+    injects the auth header itself - callers must not pass their own `headers`
     kwarg (Google's OAuth endpoints build their own headers directly and don't go
     through this helper, since they're not authenticated the same way)."""
     r = await _request_with_retry(method, url, headers=await _auth(), **kwargs)
@@ -424,7 +425,7 @@ async def _call_list(method: str, url: str, *, key: str, **kwargs: Any) -> list[
 
 async def _call_delete(method: str, url: str, deleted_id: str, **kwargs: Any) -> dict:
     # raise_for_status() only ever raises on 4xx/5xx regardless of which specific
-    # 2xx code a delete endpoint returns (200 vs 204) — no special-casing needed,
+    # 2xx code a delete endpoint returns (200 vs 204) - no special-casing needed,
     # and neither caller wants the (possibly-empty) response body anyway.
     await _call(method, url, **kwargs)
     return {"deleted": deleted_id}
@@ -449,7 +450,7 @@ async def search_emails(query: str, max_results: int = 20) -> list[dict]:
     to_enrich, rest = messages[:SEARCH_ENRICH_LIMIT], messages[SEARCH_ENRICH_LIMIT:]
 
     async def _fetch_metadata(message_id: str) -> httpx.Response | None:
-        # Deliberately NOT routed through _call/_request_with_retry — _enrich just
+        # Deliberately NOT routed through _call/_request_with_retry - _enrich just
         # below already implements its own retry loop (SEARCH_ENRICH_ATTEMPTS) with
         # degrade-to-bare-id-on-exhaustion semantics that predate and differ from
         # the generic retry helper; kept as its own reviewed, separately-tested path.
@@ -461,7 +462,7 @@ async def search_emails(query: str, max_results: int = 20) -> list[dict]:
             return None
 
     async def _enrich(msg: dict) -> dict:
-        # Network errors, rate limiting, and server errors are usually transient —
+        # Network errors, rate limiting, and server errors are usually transient -
         # retry up to SEARCH_ENRICH_ATTEMPTS total tries before degrading. Other 4xx
         # (403/404, etc.) are permanent and stop retrying immediately.
         er = None
@@ -502,7 +503,7 @@ async def search_emails(query: str, max_results: int = 20) -> list[dict]:
 @mcp.tool
 async def read_message(message_id: str) -> dict:
     """Read a Gmail message by ID. Returns headers, decoded body, and attachment
-    metadata (filename/partId/mimeType/size) — use get_attachment to download
+    metadata (filename/partId/mimeType/size) - use get_attachment to download
     an attachment's bytes."""
     data = await _call_json("GET", f"{GMAIL}/messages/{_enc(message_id)}", params={"format": "full"})
 
@@ -530,7 +531,7 @@ async def read_message(message_id: str) -> dict:
 @mcp.tool
 async def read_thread(thread_id: str) -> dict:
     """Read a full Gmail thread."""
-    # Intentionally a raw passthrough (unlike read_message) — each message's raw
+    # Intentionally a raw passthrough (unlike read_message) - each message's raw
     # payload already contains attachment parts (filename/partId/size) in its MIME
     # tree; get_attachment works from any message's own "id" here.
     return await _call_json("GET", f"{GMAIL}/threads/{_enc(thread_id)}")
@@ -697,6 +698,19 @@ async def modify_labels(message_id: str, add: list[str] | None = None,
 
 
 @mcp.tool
+async def batch_modify_labels(message_ids: list[str], add: list[str] | None = None,
+                              remove: list[str] | None = None) -> dict:
+    """Add or remove the same labels on up to 1000 Gmail messages in one call."""
+    _require_write()
+    if not 1 <= len(message_ids) <= BATCH_MODIFY_MAX:
+        raise ValueError(f"message_ids must hold 1-{BATCH_MODIFY_MAX} ids, got {len(message_ids)}")
+    # batchModify answers 204 with no body, so report what was asked instead.
+    await _call("POST", f"{GMAIL}/messages/batchModify",
+                json={"ids": message_ids, "addLabelIds": add or [], "removeLabelIds": remove or []})
+    return {"modified": len(message_ids)}
+
+
+@mcp.tool
 async def report_phishing(message_id: str) -> dict:
     """Mark a Gmail message as spam."""
     _require_write()
@@ -770,7 +784,7 @@ async def _openid_configuration(req: Request) -> JSONResponse:
 
 
 async def _protected_resource(req: Request) -> JSONResponse:
-    # The alias this was reached through (if any) — stashed into scope["state"] by
+    # The alias this was reached through (if any) - stashed into scope["state"] by
     # _App.__call__ before the alias gets stripped for routing. Echoed back here so
     # Claude's OAuth client round-trips it as the 'resource' param on /authorize,
     # letting _authorize tell which aliased connector is authenticating.
@@ -793,11 +807,11 @@ async def _authorize(req: Request):
         return Response("Only the S256 code_challenge_method is supported", status_code=400)
 
     # alias comes from server-side path routing (req.state.alias, set by
-    # _App.__call__ from the actual URL this request came in through) — never from
+    # _App.__call__ from the actual URL this request came in through) - never from
     # the client-echoed 'resource' query parameter. A restricted alias must stay
     # restricted even if an OAuth client fails to echo 'resource' correctly (or
     # omits it, or a malicious client sends a wrong one) during a restricted-alias
-    # authorization flow — otherwise the resulting Google grant gets full write
+    # authorization flow - otherwise the resulting Google grant gets full write
     # scope and the minted JWT gets read_only=False, and that JWT (not which alias
     # it was created for) is what travels with the token afterward.
     alias = getattr(req.state, "alias", "")
@@ -922,7 +936,7 @@ async def _token(req: Request) -> JSONResponse:
                          "expires_in": 86400 * 30})
 
 
-# ── Bearer auth middleware (raw ASGI — preserves ContextVar across await) ──────
+# ── Bearer auth middleware (raw ASGI - preserves ContextVar across await) ──────
 
 def _www_auth_header(alias: str) -> bytes:
     metadata_path = (f"/{alias}/.well-known/oauth-protected-resource" if alias
@@ -951,8 +965,8 @@ _SECURITY_HEADERS = [
 
 
 def _with_security_headers(send):
-    """Wraps an ASGI send() so every response — including ones from the mounted
-    OAuth/FastMCP sub-apps — gets standard security headers. /authorize is the one
+    """Wraps an ASGI send() so every response - including ones from the mounted
+    OAuth/FastMCP sub-apps - gets standard security headers. /authorize is the one
     point a real browser touches (the user's, round-tripping through Google's
     consent screen), so this is worth doing even though most traffic is API calls."""
     async def wrapped(message):
@@ -970,7 +984,7 @@ def _normalize_path(path: str) -> str:
     """Collapse repeated slashes (e.g. "//mcp" -> "/mcp") before _split_alias sees
     the path. Without this, a non-canonical path matches neither a known OAuth path
     nor the /mcp bearer-auth gate's exact-prefix check, so the request would fall
-    through with NO auth check performed at all — relying entirely on whatever the
+    through with NO auth check performed at all - relying entirely on whatever the
     downstream FastMCP/Starlette router does with the same non-canonical path
     (today it independently 404s rather than treating it as equivalent to /mcp, but
     that's downstream behavior this file has no control over, not a guarantee)."""
@@ -979,7 +993,7 @@ def _normalize_path(path: str) -> str:
 
 def _split_alias(path: str) -> tuple[str, str]:
     """Strip a leading /<alias> segment so /personal/mcp, /work/.well-known/... etc.
-    resolve the same as their unaliased routes — lets two Claude connectors share one
+    resolve the same as their unaliased routes - lets two Claude connectors share one
     server. Returns (alias, normalised_path); alias is "" when there wasn't one."""
     if path in _KNOWN_PATHS or path.startswith("/mcp/"):
         return "", path
