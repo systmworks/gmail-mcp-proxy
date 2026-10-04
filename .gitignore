@@ -5,6 +5,7 @@ __pycache__/
 .pytest_cache/
 .venv*/
 TREASURER_MAILBOX_LABEL_RULES.md
+COMMITTEE_OUTLOOK_FOLDER_SPEC.md
 SESSION_HANDOVER.md
 DEPLOYMENT.md
 stratamax-reports/
